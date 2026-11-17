@@ -97,6 +97,7 @@ let fishHelpers = [] // 每只桌宠一个同标题窗口，全都记下来
 let fishDetectRect = null // 扫像素扫出来的大肥鱼实框（屏幕 DIP）
 let fishDetectAt = 0
 let fishDetecting = false
+let lastMoveAt = 0 // 最后一次拖动位移的时间：拖动期间不做像素扫描（同步扫描会卡住拖拽）
 let fishEverSeen = false // 这一次运行里见过大肥鱼没有：从没见过 = 可能客户端根本没渲染
 const FISH_FRESH_MS = 8000 // 像素扫描的新鲜期：比轮询间隔（5 秒）宽一点
 let fishWindowCount = 0 // 上一次扫描看到的窗口数：0 = 探测本身失败，不能据此断言她不在
@@ -328,6 +329,9 @@ function startStateWatcher() {
   if (visibilityTimer) clearInterval(visibilityTimer)
   visibilityTimer = setInterval(() => {
     if (!win) return
+    // 拖动期间不读盘：readState() 是同步 readFileSync + JSON.parse，
+    // 400ms 一次在 Windows 上容易被磁盘/杀软拖住，正好打断拖拽帧
+    if (Date.now() - lastMoveAt < 300) return
     let state
     try {
       state = readState()
@@ -635,6 +639,8 @@ function selfIsSameBlob(slot, self) {
 
 async function detectFish() {
   if (fishDetecting) return fishPresent
+  // 正在拖动就别扫：整屏像素扫描是同步的（百万级像素 + 连通域），会阻塞主线程
+  if (Date.now() - lastMoveAt < 300) return fishPresent
   if (!fishGateOpen) {
     // 没有大肥鱼插件 / 插件没启用 / 她把显示关了：完全不检测（省 CPU，也不会有幽灵判定）
     fishSlots = []
@@ -1219,20 +1225,26 @@ function intendedSize() {
 
 function nudge(dx, dy) {
   if (!win) return
-  const [x, y] = win.getPosition()
+  const bounds = win.getBounds()
   const { width, height } = intendedSize()
-  // 移动时显式带上目标尺寸：只拿当前 bounds 会把 DPI 取整误差反馈成“窗口越拖越大”
-  win.setBounds({
-    x: Math.round(x + Number(dx || 0)),
-    y: Math.round(y + Number(dy || 0)),
-    width,
-    height,
-  })
-  syncSatellites()
+  const nx = Math.round(bounds.x + Number(dx || 0))
+  const ny = Math.round(bounds.y + Number(dy || 0))
+  if (bounds.width === width && bounds.height === height) {
+    // 尺寸没变就别走 setBounds：Windows 上 setBounds 带 resize 路径，
+    // 透明置顶窗每帧 resize 会掉帧，setPosition 轻得多
+    win.setPosition(nx, ny, false)
+  } else {
+    // 尺寸确实变了才显式带上目标尺寸（只拿当前 bounds 会把 DPI 取整误差放大成「越拖越大」）
+    win.setBounds({ x: nx, y: ny, width, height })
+  }
+  // 气泡没显示时不用跟着搬：以前每次都算，等于每帧多一次窗口定位
+  if (bubbleWin && !bubbleWin.isDestroyed() && bubbleWin.isVisible()) syncSatellites()
 }
 
 ipcMain.on('win:move', (_event, dx, dy) => {
-  stopThrow()
+  lastMoveAt = Date.now()
+  // 只在真的在飞的时候才收网：以前每个 mousemove 都调，等于每次多 3 条 IPC
+  if (throwTimer) stopThrow()
   nudge(dx, dy)
 })
 ipcMain.on('win:hide', () => hidePet())

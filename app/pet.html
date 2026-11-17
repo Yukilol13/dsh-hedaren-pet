@@ -531,7 +531,6 @@ window.addEventListener('mousedown', (e) => {
   if (e.button !== 0) return
   window.heshen.closeMenu() // 左键落下时先收起右键菜单，保证一定能拖
   window.heshen.stopThrow()
-  window.heshen.prefetchFish?.() // 拖动一开始就重扫大肥鱼位置
   // 万一「甩飞」形象卡住了，用户一抓就恢复待机
   if ((currentAnim === '甩飞' || currentAnim === '甩飞-左') && throwFaceAt) {
     throwFaceAt = 0
@@ -553,20 +552,35 @@ window.addEventListener('mousedown', (e) => {
   }
   e.preventDefault()
 })
+// 每个动画帧最多向主进程发一次位移。
+// Windows 高回报率鼠标一秒能发 125–1000 个 mousemove，每个都 IPC + 移动窗口
+// 会把主进程压满（拖拽卡顿的主因），这里合并成帧级增量。
+let pendingMove = null
+let moveRaf = 0
+function flushMove() {
+  moveRaf = 0
+  if (!pendingMove) return
+  const { dx, dy } = pendingMove
+  pendingMove = null
+  window.heshen.moveBy(dx, dy)
+}
+
 window.addEventListener('mousemove', (e) => {
   if (!drag) return
   const dx = e.screenX - drag.x
   const dy = e.screenY - drag.y
   if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true
-  if (drag.moved) {
-    window.heshen.moveBy(dx, dy)
-    drag.x = e.screenX
-    drag.y = e.screenY
-    drag.trail.push({ t: performance.now(), x: e.screenX, y: e.screenY })
-    while (drag.trail.length > 3 && performance.now() - drag.trail[0].t > THROW_WINDOW_MS) {
-      drag.trail.shift()
-    }
+  if (!drag.moved) return
+  drag.x = e.screenX
+  drag.y = e.screenY
+  drag.trail.push({ t: performance.now(), x: e.screenX, y: e.screenY })
+  while (drag.trail.length > 3 && performance.now() - drag.trail[0].t > THROW_WINDOW_MS) {
+    drag.trail.shift()
   }
+  pendingMove = pendingMove
+    ? { dx: pendingMove.dx + dx, dy: pendingMove.dy + dy }
+    : { dx, dy }
+  if (!moveRaf) moveRaf = requestAnimationFrame(flushMove)
 })
 
 /** 取松手前一个短窗口内的位移，换算成甩动速度和力度。 */
@@ -613,6 +627,11 @@ function stillMsBefore(trail, releaseT, settleMs) {
 
 window.addEventListener('mouseup', (e) => {
   if (!drag) return
+  if (moveRaf) {
+    cancelAnimationFrame(moveRaf)
+    moveRaf = 0
+  }
+  flushMove()
   const wasMoved = drag.moved
   if (wasMoved) {
     const releaseT = performance.now()
