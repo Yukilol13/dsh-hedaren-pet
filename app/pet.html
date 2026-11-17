@@ -1,0 +1,759 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>和大人</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; width: 100%; height: 100%;
+    background: transparent; overflow: hidden;
+    user-select: none; -webkit-user-select: none;
+    cursor: grab;
+  }
+  body:active { cursor: grabbing; }
+  #wrap {
+    position: absolute; inset: 0;
+    transform-origin: 50% 100%;
+    pointer-events: none;
+  }
+  #wrap.squash { animation: petSquash .32s cubic-bezier(.2,.8,.3,1); }
+  @keyframes petSquash {
+    0% { transform: scale(1, 1); }
+    25% { transform: scale(1.06, .9); }
+    55% { transform: scale(.98, 1.03); }
+    100% { transform: scale(1, 1); }
+  }
+  #flip {
+    position: absolute; inset: 0;
+    pointer-events: none;
+    /* 镜像：绕「帽子中心」这条竖线翻，人不会左右跑 */
+    transform-origin: 50% 100%;
+  }
+  #flip.mirror { transform: scaleX(-1); }
+  #anim {
+    display: block;
+    position: absolute;
+    transform-origin: 50% 100%;
+  }
+  /* 站立呼吸：静态图向下压扁 5% 再回弹 */
+  #anim.breathe { animation: petBreathe 4.4s ease-in-out infinite; }
+  @keyframes petBreathe {
+    0%, 100% { transform: scaleY(1); }
+    50% { transform: scaleY(.95); }
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><div id="flip"><img id="anim" alt="" /></div></div>
+<script>
+const $ = (s) => document.querySelector(s)
+const wrap = $('#wrap')
+const flipEl = $('#flip')
+const animEl = $('#anim')
+
+const PAD = 4
+const THROW_WINDOW_MS = 140      // 只统计松手前这一段轨迹
+const THROW_MIN_DIST = 55        // 窗口内位移超过这个值才算甩
+const THROW_MIN_SPEED = 380      // 窗口内平均速度下限（px/s）
+const THROW_JITTER_PX = 8        // 判停半径：这段时间里只在这个方块内晃 = 手已经停了
+const THROW_SETTLE_MIN = 50      // 甩飞阈值下限（ms）
+const THROW_SETTLE_MAX = 500     // 甩飞阈值上限（ms）
+let throwSettleMs = THROW_SETTLE_MIN // 松手前静止超过这么久就不甩飞（右键菜单可调）
+const IDLE = '待机-呼吸'
+const IDLE_BREATH = '待机-呼吸'
+const JAIL_IDLE = '待机-牢房'
+const JAIL_IDLE_LEFT = '待机-牢房-左'
+const BOW = '点击-拱手'
+
+const ANIM_FILES = {
+  '甩飞': 'thrown',
+  '甩飞-左': 'thrown-left',
+  '待机-牢房': 'idle-jail',
+  '待机-牢房-左': 'idle-jail-left',
+  '待机-官服': 'idle',
+  '点击-拱手': 'bow',
+  '银票打手': 'slap',
+  '常服进门': 'changfu',
+  '递古董': 'gift',
+  '斗嘴': 'douzui',
+  '琉璃厂': 'liulichang',
+  '跪舔': 'kneel',
+  '常服算账': 'suanzhang',
+  '塞银票': 'saiyinhpiao',
+  '拍马屁': 'paimapi',
+  '被参一本': 'beican',
+  '网住大肥鱼': 'netcatch',
+  '网住大肥鱼-左': 'netcatch-left',
+  '府里数银': 'shuyin',
+  '点钞': 'dianchao',
+  '工作-掏出': 'work-start',
+  '工作-循环': 'work-loop',
+  '工作-收起': 'work-end',
+  '工作-过渡': 'work-tail',
+  '待机-呼吸': 'idle-static',
+  '待机-捻须': 'idle-nianxu',
+  '待机-背手': 'idle-beishou',
+  '待机-打哈欠': 'idle-hachian',
+  '待机-数朝珠': 'idle-shuzhu',
+}
+
+const CLICK_ANIMS = ['点击-拱手', '递古董', '跪舔', '银票打手', '斗嘴']
+const CLICK_LINES = {
+  '点击-拱手': '皇上圣明，奴才给您行礼了！',
+  '递古董': '皇上，这件青花瓷瓶，奴才特意给您寻来的。',
+  '银票打手': '我怎么就管不住这手呢！',
+  '斗嘴': '皇上，奴才这张嘴可不饶人！',
+  '跪舔': '皇上，奴才给您磕头了！',
+  '琉璃厂': '这件东西，才是真正的宝贝。',
+}
+const LINES = {
+  click: ['皇上圣明，奴才给您行礼了！', '奴才在呢，皇上有什么吩咐？', '皇上您一句话，奴才跑断腿也办妥。'],
+}
+
+let layout = {}
+let state = { anim: { id: 0, name: IDLE, loop: true }, visible: true, scale: 1 }
+let currentAnim = ''
+let currentMeta = null
+const SIZE_BASE = 0.75   // 整体缩小到 3/4，作为「100%」
+let animTimer = null
+let animEndHandler = null
+let workPhase = 'idle'
+let userOverride = ''
+let lastAnimId = -1
+let lastCaptureAt = 0 // 上一次处理的捕捉事件（捕捉要打断工作动画，单独记）
+let drag = null
+let mirrored = false // 是否镜像显示（随机出现；工作中不切换）
+let mirrorTimer = null
+let throwFaceAt = 0 // 甩飞形象的起止时间（>0 表示正在飞）
+let throwFaceGen = 0 // 世代号：旧定时器/旧事件不能收掉新形象
+let flightFacing = '' // 飞行朝向：'left' | 'right' | ''（由主进程按速度方向推送）
+let jailUntil = 0 // 牢房待机截止时间（插件在查国库发现余额低于阈值时写入）
+let throwFaceTimer = null
+
+function pick(list) { return list[Math.floor(Math.random() * list.length)] }
+
+function metricsOf(name, fileOverride) {
+  const file = fileOverride || ANIM_FILES[name] || 'idle'
+  const meta =
+    layout[file] ||
+    layout.idle || {
+      canvas: [210, 263],
+      left: 0,
+      top: 0,
+      width: 210,
+      height: 263,
+      anchorX: 105,
+      frames: 96,
+    }
+  return { ...meta, file, name }
+}
+
+function applyMeta(name, fileOverride) {
+  currentMeta = metricsOf(name, fileOverride)
+  const { width: w, height: h, left, top, anchorX } = currentMeta
+  const canvasW = (currentMeta.canvas && currentMeta.canvas[0]) || 278
+  const canvasH = (currentMeta.canvas && currentMeta.canvas[1]) || 306
+  // 画布按原尺寸缩放，整体左移/上移，让着墨范围正好落在窗口内边距上
+  animEl.style.width = `${canvasW * scale}px`
+  animEl.style.height = `${canvasH * scale}px`
+  animEl.style.left = `${PAD - left * scale}px`
+  animEl.style.top = `${PAD - top * scale}px`
+  // 镜像绕帽子中心翻：帽中心在窗口里的 x = 内边距 + anchorX * 缩放
+  flipEl.style.transformOrigin = `${PAD + anchorX * scale}px 100%`
+  // 不对称的动作（比如「网住大肥鱼」那种两人同框）翻过来会出窗口，直接取消镜像
+  if (mirrored && !mirrorSafe()) setMirror(false)
+  window.heshen.metrics({
+    width: w,
+    height: h,
+    canvasW,
+    canvasH,
+    anchorX,
+    scale,
+    name,
+  })
+}
+
+/** 这个动作翻过来会不会出窗口：着墨框左右是否大致对称 */
+function mirrorSafe() {
+  const meta = currentMeta
+  if (!meta) return false
+  if (currentAnim.startsWith('工作-') || currentAnim === '网住大肥鱼' || currentAnim === '网住大肥鱼-左' || currentAnim === '甩飞' || currentAnim === '甩飞-左') return false
+  if (currentAnim === JAIL_IDLE || currentAnim === JAIL_IDLE_LEFT) return true
+  return Math.abs(meta.anchorX - meta.width / 2) <= 12
+}
+
+function setMirror(on) {
+  const next = Boolean(on)
+  if (next === mirrored) return
+  mirrored = next
+  flipEl.classList.toggle('mirror', mirrored)
+  console.log('mirror', mirrored, currentAnim)
+  // 牢房那张左右不对称（右边有木桶），翻 CSS 会出窗口 → 直接换镜像素材
+  if (currentAnim === JAIL_IDLE || currentAnim === JAIL_IDLE_LEFT) {
+    playAnim(mirrored ? JAIL_IDLE_LEFT : JAIL_IDLE, true)
+  }
+}
+
+/**
+ * 随机照镜子：每 9–21 秒掷一次骰子，40% 概率翻/翻回来。
+ * 工作中（state.work.active）不切换；动作本身不对称（网住/工作）也不翻。
+ */
+function scheduleMirror() {
+  if (mirrorTimer) clearTimeout(mirrorTimer)
+  mirrorTimer = setTimeout(() => {
+    mirrorTimer = null
+    const working = Boolean(state.work && state.work.active)
+    if (!working && mirrorSafe() && Math.random() < 0.4) setMirror(!mirrored)
+    scheduleMirror()
+  }, 9000 + Math.random() * 12000)
+}
+
+/** 调试面板：实际窗口尺寸 vs 期望尺寸，用来查窗口是否贴合角色。 */
+
+function animDuration(name) {
+  const meta = layout[ANIM_FILES[name] || ''] || {}
+  const explicit = Number(meta.duration)
+  if (Number.isFinite(explicit) && explicit > 0) return explicit
+  const frames = Number(meta.frames)
+  return Number.isFinite(frames) && frames > 0 ? frames * 33 + 40 : 1800
+}
+
+function playAnim(name, loop = true) {
+  const safe = String(name || IDLE).replace(/[\\/:*?"<>|]/g, '')
+  if (!safe) return
+  if (safe === currentAnim) return
+  currentAnim = safe
+  const jailIdle = safe === JAIL_IDLE || safe === JAIL_IDLE_LEFT
+  const breathing = safe === IDLE_BREATH || jailIdle
+  const file = jailIdle
+    ? (safe === JAIL_IDLE_LEFT ? 'idle-jail-left' : 'idle-jail')
+    : breathing
+      ? idleBreathFile()
+      : ANIM_FILES[safe] || 'idle'
+  animEl.classList.toggle('breathe', breathing)
+  animEl.src = 'animations/' + file + (breathing ? '.png' : '.webp')
+  applyMeta(safe, breathing ? file : undefined)
+  if (animTimer) {
+    clearTimeout(animTimer)
+    animTimer = null
+  }
+  if (loop === false) {
+    animTimer = setTimeout(() => {
+      animTimer = null
+      const handler = animEndHandler
+      animEndHandler = null
+      if (handler) handler(safe)
+      else if (currentAnim === safe) returnToIdle()
+    }, animDuration(safe))
+  }
+}
+
+// ---- 待机循环：常服 / 官服 呼吸交替 + 定时随机播一个待机小动作 ----
+const IDLE_ACTIONS = ['待机-捻须', '待机-背手', '待机-打哈欠', '待机-数朝珠']
+const OUTFITS = ['官服', '常服']
+let outfitIndex = location.hash === '#changfu' ? 1 : 0
+let idleActionTimer = null
+let outfitTimer = null
+let idleRestTimer = null
+
+function idleBreathFile() {
+  return OUTFITS[outfitIndex] === '常服' ? 'idle-changfu' : 'idle-static'
+}
+
+function scheduleOutfitSwap() {
+  if (outfitTimer) clearTimeout(outfitTimer)
+  outfitTimer = setTimeout(() => {
+    outfitTimer = null
+    outfitIndex = (outfitIndex + 1) % OUTFITS.length
+    if (currentAnim === IDLE_BREATH && !state.work?.active) {
+      animEl.src = 'animations/' + idleBreathFile() + '.png'
+      applyMeta(IDLE_BREATH, idleBreathFile())
+    }
+    scheduleOutfitSwap()
+  }, 24000 + Math.random() * 18000)
+}
+
+function scheduleIdleAction() {
+  if (idleActionTimer) clearTimeout(idleActionTimer)
+  idleActionTimer = setTimeout(() => {
+    idleActionTimer = null
+    if (state.work?.active || workPhase !== 'idle') {
+      scheduleIdleAction()
+      return
+    }
+    if (currentAnim !== IDLE_BREATH) {
+      scheduleIdleAction()
+      return
+    }
+    const name = pick(IDLE_ACTIONS)
+    playAnim(name, true)
+    if (idleRestTimer) clearTimeout(idleRestTimer)
+    idleRestTimer = setTimeout(() => {
+      idleRestTimer = null
+      if (!state.work?.active && currentAnim === name) returnToIdle()
+    }, 6000 + Math.random() * 4000)
+    scheduleIdleAction()
+  }, 14000 + Math.random() * 10000)
+}
+
+function returnToIdle() {
+  if (Date.now() >= jailUntil && state.work?.active) {
+    // 工作态也要换图：交给工作动画，别让调用方以为已经恢复
+    if (workPhase === 'idle' || workPhase === 'tail') startWorkAnim()
+    else if (currentAnim !== '工作-循环' && currentAnim !== '工作-掏出') playAnim('工作-循环', true)
+    return
+  }
+  if (Date.now() < jailUntil) {
+    playAnim(mirrored ? JAIL_IDLE_LEFT : JAIL_IDLE, true)
+    scheduleJailEnd()
+    return
+  }
+  playAnim(IDLE_BREATH, true)
+}
+
+/** 牢房期结束时切回正常待机（只安排一次） */
+let jailEndTimer = null
+function scheduleJailEnd() {
+  if (jailEndTimer) return
+  const left = Math.max(200, jailUntil - Date.now() + 60)
+  jailEndTimer = setTimeout(() => {
+    jailEndTimer = null
+    if (currentAnim === JAIL_IDLE || currentAnim === JAIL_IDLE_LEFT) returnToIdle()
+  }, left)
+}
+
+/**
+ * 甩飞：飞行途中换成「举网冲过去」的形象，等窗口停下来（或 4 秒兜底）再回待机。
+ * 这就是素材大师那张大头举网图：角色高度和点钞齐平（259），飞起来时不会缩水。
+ */
+function showThrowFace() {
+  throwFaceAt = performance.now()
+  throwFaceGen += 1 // 每次点亮都是一个新世代：旧定时器不能收掉新形象
+  const gen = throwFaceGen
+  if (mirrored) setMirror(false) // 举网的姿势左右不对称，翻过来会出窗口
+  const face = flightFacing === 'left' ? '甩飞-左' : '甩飞'
+  // 同名也强制重设一次：万一 img 被别处改回待机图，playAnim 同名会直接 return
+  if (currentAnim === face) currentAnim = ''
+  playAnim(face, true)
+  console.log('throwFace on', face, 'gen=' + gen, 'src=' + animEl.getAttribute('src'))
+  // 纯时间驱动：最多亮 3 秒（覆盖弹跳全程），「飞行结束」可提前收（不短于 500ms）
+  if (throwFaceTimer) clearTimeout(throwFaceTimer)
+  throwFaceTimer = setTimeout(() => {
+    throwFaceTimer = null
+    endThrowFace(gen)
+  }, 3000)
+}
+
+function endThrowFace(gen) {
+  if (gen !== undefined && gen !== throwFaceGen) return // 旧世代：忽略
+  if (throwFaceTimer) {
+    clearTimeout(throwFaceTimer)
+    throwFaceTimer = null
+  }
+  // 举网形象至少亮 500ms（甩得轻/一甩就撞到鱼时，飞行只有一两百毫秒）
+  const shownFor = performance.now() - throwFaceAt
+  if (throwFaceAt && shownFor < 500) {
+    const g = throwFaceGen
+    setTimeout(() => endThrowFace(g), Math.max(60, 500 - shownFor))
+    return
+  }
+  console.log('throwFace off elapsed=' + Math.round(performance.now() - throwFaceAt), currentAnim)
+  throwFaceAt = 0
+  if (currentAnim === '甩飞' || currentAnim === '甩飞-左') {
+    if (state.work?.active) {
+      workPhase = 'idle'
+      startWorkAnim()
+    } else {
+      playAnim(Date.now() < jailUntil ? JAIL_IDLE : IDLE_BREATH, true)
+    }
+  }
+}
+
+function startWorkAnim() {
+  workPhase = 'start'
+  userOverride = ''
+  animEndHandler = () => {
+    workPhase = 'working'
+    playAnim('工作-循环', true)
+  }
+  playAnim('工作-掏出', false)
+}
+
+function endWorkAnim() {
+  workPhase = 'end'
+  userOverride = ''
+  animEndHandler = () => {
+    workPhase = 'tail'
+    animEndHandler = () => {
+      workPhase = 'idle'
+      returnToIdle()
+    }
+    playAnim('工作-过渡', false)
+  }
+  playAnim('工作-收起', false)
+}
+
+function clickPet() {
+  const animName = pick(CLICK_ANIMS)
+  const line = CLICK_LINES[animName] || pick(LINES.click)
+  void save({
+    say: { id: Date.now(), text: line },
+    anim: { id: Date.now(), name: animName, loop: false },
+  })
+}
+
+async function save(patch) {
+  try {
+    const merged = await window.heshen.writeState(patch)
+    applyState(merged)
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+function applyState(next) {
+  if (!next) return
+  state = {
+    ...state,
+    ...next,
+    anim: { ...state.anim, ...(next.anim || {}) },
+  }
+  if (state.visible === false) {
+    document.body.style.display = 'none'
+    return
+  }
+  document.body.style.display = ''
+  // 网住大肥鱼这类捕捉演出优先级最高：工作动画、待机循环都得先让开
+  const capAt = Number(state.capture?.at) || 0
+  if (capAt && capAt !== lastCaptureAt) {
+    lastCaptureAt = capAt
+    const capBase = String(state.capture?.anim || '网住大肥鱼')
+    // 向左飞时撞上的捕捉，用镜像版（面向左）；朝向以捕捉事件里带的为准
+    const capFacing = String(state.capture?.facing || flightFacing || '')
+    const capAnim = capBase === '网住大肥鱼' && capFacing === 'left' ? '网住大肥鱼-左' : capBase
+    workPhase = 'idle'
+    userOverride = ''
+    if (animTimer) {
+      clearTimeout(animTimer)
+      animTimer = null
+    }
+    animEndHandler = null
+    playAnim(capAnim, false)
+    return
+  }
+
+  // 甩飞途中以「举网」形象为准，别被待机/工作的轮询覆盖（捕捉已在上面优先处理）
+  // 看门狗：举网形象最多亮 4 秒，超时强制收掉，避免任何路径漏掉 endThrowFace
+  if (throwFaceAt && performance.now() - throwFaceAt > 4000) {
+    console.log('throwFace watchdog clear')
+    throwFaceAt = 0
+    if (throwFaceTimer) {
+      clearInterval(throwFaceTimer)
+      throwFaceTimer = null
+    }
+  }
+
+  if (throwFaceAt) {
+    if (state.work?.active) {
+      // 飞行中状态变成工作：照样先飞完，落地后再走工作动画
+      workPhase = workPhase === 'working' ? 'idle' : workPhase
+    }
+    return
+  }
+
+  // 牢房待机（查国库发现欠债时触发）：期间用囚犯形象，工作/捕捉优先
+  const jailAt = Number(state.jail?.until) || 0
+  if (jailAt > jailUntil) jailUntil = jailAt
+  // 牢房是「查国库发现欠债」的戏剧时刻：哪怕正在干活也先演这一出，演完再回去干活
+  if (jailUntil > Date.now()) {
+    if (state.work?.active) workPhase = 'idle'
+    if (currentAnim !== JAIL_IDLE && currentAnim !== JAIL_IDLE_LEFT) {
+      playAnim(mirrored ? JAIL_IDLE_LEFT : JAIL_IDLE, true)
+    }
+    scheduleJailEnd()
+    return // 牢房期间不让工作/待机循环抢镜
+  }
+
+  const nextScale = Math.max(0.7, Math.min(1.5, Number(state.scale) || 1)) * SIZE_BASE
+  if (Math.abs(nextScale - scale) > 0.001) {
+    scale = nextScale
+    if (currentAnim) applyMeta(currentAnim)
+  }
+  if (state.work?.active) {
+    if (workPhase === 'idle' || workPhase === 'tail') startWorkAnim()
+    else if (workPhase === 'working') {
+      // 工作中的点单：用户点的动作先播一遍，播完自动回到点钞循环
+      if (state.anim && state.anim.id !== lastAnimId) {
+        lastAnimId = state.anim.id
+        const name = state.anim.name || ''
+        if (name && name !== '工作-循环' && !name.startsWith('工作-')) {
+          userOverride = name
+          playAnim(name, state.anim.loop !== false)
+          if (animTimer) clearTimeout(animTimer)
+          animTimer = setTimeout(() => {
+            animTimer = null
+            userOverride = ''
+            if (workPhase === 'working' && state.work?.active) playAnim('工作-循环', true)
+          }, animDuration(name))
+          return
+        }
+      }
+      if (!userOverride && currentAnim !== '工作-循环') playAnim('工作-循环', true)
+    }
+    return
+  }
+  if (workPhase === 'start' || workPhase === 'working') {
+    endWorkAnim()
+    return
+  }
+  // 收钞 → 过渡 → 待机，这两段不打断
+  if (workPhase === 'end' || workPhase === 'tail') return
+  if (state.anim && state.anim.id !== lastAnimId) {
+    lastAnimId = state.anim.id
+    playAnim(state.anim.name || IDLE, state.anim.loop !== false)
+  }
+}
+
+// 拖动 + 松手弹射（按加速度判定）
+window.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return
+  window.heshen.closeMenu() // 左键落下时先收起右键菜单，保证一定能拖
+  window.heshen.stopThrow()
+  window.heshen.prefetchFish?.() // 拖动一开始就重扫大肥鱼位置
+  // 万一「甩飞」形象卡住了，用户一抓就恢复待机
+  if ((currentAnim === '甩飞' || currentAnim === '甩飞-左') && throwFaceAt) {
+    throwFaceAt = 0
+    if (throwFaceTimer) {
+      clearInterval(throwFaceTimer)
+      throwFaceTimer = null
+    }
+    returnToIdle()
+  }
+  wrap.classList.remove('squash')
+  drag = {
+    x: e.screenX,
+    y: e.screenY,
+    moved: false,
+    trail: [
+      { t: performance.now(), x: e.screenX, y: e.screenY },
+      { t: performance.now(), x: e.screenX, y: e.screenY },
+    ],
+  }
+  e.preventDefault()
+})
+window.addEventListener('mousemove', (e) => {
+  if (!drag) return
+  const dx = e.screenX - drag.x
+  const dy = e.screenY - drag.y
+  if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true
+  if (drag.moved) {
+    window.heshen.moveBy(dx, dy)
+    drag.x = e.screenX
+    drag.y = e.screenY
+    drag.trail.push({ t: performance.now(), x: e.screenX, y: e.screenY })
+    while (drag.trail.length > 3 && performance.now() - drag.trail[0].t > THROW_WINDOW_MS) {
+      drag.trail.shift()
+    }
+  }
+})
+
+/** 取松手前一个短窗口内的位移，换算成甩动速度和力度。 */
+function releaseMomentum(trail) {
+  if (trail.length < 2) return null
+  const last = trail[trail.length - 1]
+  // 从尾部往前找窗口内最早的点
+  let first = trail[0]
+  for (let i = trail.length - 1; i >= 0; i--) {
+    if (last.t - trail[i].t <= THROW_WINDOW_MS) first = trail[i]
+    else break
+  }
+  const dt = (last.t - first.t) / 1000
+  if (dt <= 0.001) return null
+  const dx = last.x - first.x
+  const dy = last.y - first.y
+  const dist = Math.hypot(dx, dy)
+  return { dx, dy, dist, dt, speed: dist / dt, vx: dx / dt, vy: dy / dt }
+}
+
+/**
+ * 松手前指针已经「不再有效移动」多久（ms）。
+ * 判定方式：从末尾往前走，只要采样点还在松手点周围 THROW_JITTER_PX 的小圈里，
+ * 就都算「原地晃」。走到第一个超出小圈的点，那就是最后一次真正的移动。
+ * 停下以后系统不再发 mousemove，所以「静止时长」自然等于松手时刻减去那个点。
+ */
+function stillMsBefore(trail, releaseT, settleMs) {
+  if (!trail || trail.length < 2) return 0
+  const last = trail[trail.length - 1]
+  let moveT = last.t
+  for (let i = trail.length - 1; i >= 0; i--) {
+    const p = trail[i]
+    // 出了抖动圈：这就是最后一次有效移动
+    if (Math.hypot(p.x - last.x, p.y - last.y) > THROW_JITTER_PX) {
+      moveT = p.t
+      break
+    }
+    moveT = p.t
+    // 已经很早就开始原地晃了，不必再往前找
+    if (releaseT - p.t > settleMs) break
+  }
+  return Math.max(0, releaseT - moveT)
+}
+
+window.addEventListener('mouseup', (e) => {
+  if (!drag) return
+  const wasMoved = drag.moved
+  if (wasMoved) {
+    const releaseT = performance.now()
+    const m = releaseMomentum(drag.trail)
+    // 两个条件都要满足：
+    //   1) 松手前 140ms 位移 / 速度够大（真的是在甩，不是慢拖）
+    //   2) 松手前 throwSettleMs 内指针还在动（停下来或者只在原地晃就不许飞）
+    const fastEnough = m && m.dist > THROW_MIN_DIST && m.speed > THROW_MIN_SPEED
+    const stillMs = stillMsBefore(drag.trail, releaseT, throwSettleMs)
+    const settled = stillMs > throwSettleMs
+    if (fastEnough && !settled) {
+      // 力度按位移大小递增（越猛越快），上限 1
+      const power = Math.min(1, (m.dist - THROW_MIN_DIST) / (THROW_MIN_DIST * 2.2) + 0.35)
+      const vx = Math.max(-3600, Math.min(3600, m.vx * power))
+      const vy = Math.max(-3600, Math.min(3600, m.vy * power))
+      showThrowFace()
+      window.heshen.throwPet(vx, vy)
+    } else {
+      // 交给主进程日志，方便确认「为什么没飞」：settled=true 说明松手前手已经停了/只在抖
+      window.heshen.throwSkip({
+        settled,
+        stillMs: Math.round(stillMs),
+        settleMs: throwSettleMs,
+        dist: m ? Math.round(m.dist) : 0,
+        speed: m ? Math.round(m.speed) : 0,
+      })
+    }
+  }
+  drag = null
+  if (!wasMoved && e.button === 0) clickPet()
+})
+
+window.addEventListener('contextmenu', (e) => {
+  e.preventDefault()
+  window.heshen.openMenu({ x: Math.round(e.screenX), y: Math.round(e.screenY) })
+})
+
+// 测试钩子：让主进程能直接点亮「甩飞」形象（验证左右朝向用）
+window.__heshenThrowFace = showThrowFace
+
+window.heshen.onFacing?.((dir) => {
+  const next = dir === 'left' || dir === 'right' ? dir : ''
+  if (next === flightFacing) return
+  flightFacing = next
+  // 飞行中方向变了（含撞墙回弹）：立刻换朝向
+  if (throwFaceAt && (currentAnim === '甩飞' || currentAnim === '甩飞-左')) {
+    playAnim(flightFacing === 'left' ? '甩飞-左' : '甩飞', true)
+  }
+})
+
+// 主进程说「飞行结束」：立刻收掉甩飞形象，别卡在举网状态
+// 主进程每 100ms 播一次飞行状态：在飞就保持「举网」（含弹跳），停了才收
+window.heshen.onThrowState?.((st) => {
+  const active = Boolean(st && st.active)
+  if (active) {
+    if (!throwFaceAt) {
+      flightFacing = st.dir === 'left' ? 'left' : st.dir === 'right' ? 'right' : flightFacing
+      showThrowFace()
+      return
+    }
+    // 飞行中方向变化 → 换镜像素材（不重开定时器）
+    const want = st.dir === 'left' ? '甩飞-左' : st.dir === 'right' ? '甩飞' : ''
+    if (want && currentAnim !== want && (currentAnim === '甩飞' || currentAnim === '甩飞-左')) {
+      flightFacing = st.dir
+      currentAnim = ''
+      playAnim(want, true)
+    }
+    // 还在飞：把「至少亮 3 秒」延长一点，避免半空被定时器收掉
+    if (throwFaceTimer) clearTimeout(throwFaceTimer)
+    const gen = throwFaceGen
+    throwFaceTimer = setTimeout(() => {
+      throwFaceTimer = null
+      endThrowFace(gen)
+    }, 3000)
+  } else if (throwFaceAt) {
+    endThrowFace(throwFaceGen)
+  }
+})
+
+window.heshen.onThrowEnd?.(() => {
+  if (!throwFaceAt) return
+  // 走统一的收尾（会保证举网形象至少亮 500ms，不会一闪而过）
+  endThrowFace()
+})
+
+window.heshen.onBounce(() => {
+  wrap.classList.remove('squash')
+  void wrap.offsetWidth
+  wrap.classList.add('squash')
+  setTimeout(() => wrap.classList.remove('squash'), 360)
+})
+window.heshen.onScale((value) => {
+  const next = Math.max(0.7, Math.min(1.5, Number(value) || 1)) * SIZE_BASE
+  if (Math.abs(next - scale) < 0.001) return
+  scale = next
+  if (currentAnim) applyMeta(currentAnim)
+})
+window.heshen.onThrowSettle((value) => {
+  const next = clampSettle(value)
+  if (next === throwSettleMs) return
+  throwSettleMs = next
+  console.log('throwSettleMs', next)
+})
+
+function clampSettle(value) {
+  return Math.max(THROW_SETTLE_MIN, Math.min(THROW_SETTLE_MAX, Math.round(Number(value) || THROW_SETTLE_MIN)))
+}
+
+animEl.addEventListener('error', () => console.error('anim error', currentAnim))
+animEl.addEventListener('load', () => console.log('anim loaded', currentAnim))
+
+async function boot() {
+  try {
+    const res = await fetch('animations/layout.json')
+    if (res.ok) layout = await res.json()
+  } catch {}
+  try {
+    const s = await window.heshen.readState()
+    scale = Math.max(0.7, Math.min(1.5, Number(s.scale) || 1)) * SIZE_BASE
+    throwSettleMs = clampSettle(s.throwSettleMs)
+    if (location.hash.includes('mirror')) setMirror(true)
+    if (location.hash.includes('throwface')) {
+      // 测试：直接亮 3 秒甩飞形象（不依赖真的拖拽）；throwface-left 顺带验证镜像版
+      if (location.hash.includes('throwface-left')) flightFacing = 'left'
+      throwFaceAt = performance.now()
+      playAnim(flightFacing === 'left' ? '甩飞-左' : '甩飞', true)
+      setTimeout(() => {
+        if (currentAnim === '甩飞') endThrowFace()
+      }, 3000)
+    }
+    lastCaptureAt = Number(s.capture?.at) || 0
+    // 上次退出前没播完的一次性动作（loop === false）只消费不重播；循环动作照播
+    lastAnimId = -1
+    if (s.anim && s.anim.loop === false) {
+      lastAnimId = Number(s.anim.id) || -1
+      applyState({ ...s, anim: { ...s.anim, id: 0 } })
+    } else {
+      applyState(s)
+    }
+    if (!currentAnim) playAnim(IDLE_BREATH, true)
+  } catch (e) {
+    console.error(e)
+  }
+  scheduleMirror()
+  setInterval(async () => {
+    try {
+      applyState(await window.heshen.readState())
+    } catch {}
+  }, 800)
+}
+boot()
+</script>
+</body>
+</html>

@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>和大人 · 菜单</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; width: 100%; height: 100%;
+    background: transparent; overflow: hidden;
+    user-select: none; -webkit-user-select: none;
+    font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  }
+  #menu {
+    width: 100%;
+    padding: 6px;
+    border-radius: 12px;
+    background: rgba(28, 30, 36, .97);
+    color: #f6f1e6;
+    font-size: 13px;
+    box-shadow: 0 14px 40px rgba(0,0,0,.5);
+  }
+  #menu .muted { color: rgba(246,241,230,.55); font-size: 11px; padding: 3px 10px; }
+  #menu button {
+    display: block; width: 100%; text-align: left;
+    padding: 7px 10px; border: 0; border-radius: 8px;
+    background: transparent; color: inherit; font: inherit; cursor: pointer;
+  }
+  #menu button:hover { background: rgba(255,255,255,.10); }
+  #menu .sep { height: 1px; margin: 5px 4px; background: rgba(255,255,255,.12); }
+  #menu .cat span { float: right; opacity: .55; margin-left: 16px; }
+  .scaleRow {
+    display: flex; align-items: center; gap: 7px;
+    padding: 3px 8px 7px; font-size: 11px; color: rgba(246,241,230,.62);
+  }
+  .scaleRow input[type="range"] {
+    -webkit-appearance: none; appearance: none; flex: 1; min-width: 70px;
+    height: 4px; border-radius: 999px; background: rgba(255,255,255,.22); outline: none;
+  }
+  .scaleRow input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%;
+    background: #d4af37; box-shadow: 0 0 0 2px rgba(0,0,0,.4); cursor: pointer;
+  }
+  #scaleVal, #settleVal { min-width: 40px; text-align: right; color: rgba(246,241,230,.85); }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 999px; }
+  ::-webkit-scrollbar-track { background: transparent; }</style>
+</head>
+<body>
+<div id="menu"></div>
+<script>
+const $ = (s) => document.querySelector(s)
+const menu = $('#menu')
+
+// 只有这些动作循环播放，其余动作播放一遍就回待机
+const LOOPING_ANIMS = new Set([
+  '待机-呼吸',
+  '待机-捻须',
+  '待机-背手',
+  '待机-打哈欠',
+  '待机-数朝珠',
+  '工作-循环',
+])
+
+const FACE_LINES = {
+  '01-招牌笑': '皇上圣明，奴才给您请安了。',
+  '02-算计': '这笔账，奴才得好好算算……',
+  '03-惊讶': '哎哟，这可了不得了！',
+  '04-委屈': '奴才冤枉啊……',
+  '05-得意': '皇上圣明！皇上说得太对了！',
+  '06-恼怒': '这事儿，奴才可不答应！',
+  '07-害怕': '皇上明鉴，奴才知错了！',
+  '08-困倦': '夜深了，奴才实在撑不住了……',
+}
+
+const TREE = {
+  rite: {
+    label: '礼仪动作',
+    items: [
+      { label: '行个礼', action: 'play', anim: '点击-拱手', text: '皇上圣明，奴才给您行礼了！' },
+      { label: '递古董', action: 'play', anim: '递古董', text: '皇上，这件青花瓷瓶，奴才特意给您寻来的。' },
+      { label: '跪舔', action: 'play', anim: '跪舔', text: '皇上万岁，奴才给您磕头了！' },
+      { label: '拍马屁', action: 'play', anim: '拍马屁', text: '皇上圣明！皇上说得太对了！' },
+      { label: '被参一本', action: 'play', anim: '被参一本', text: '皇上明鉴！奴才冤枉啊！' },
+    ],
+  },
+  life: {
+    label: '日常金钱',
+    items: [
+      { label: '琉璃厂', action: 'play', anim: '琉璃厂', text: '这件东西，才是真正的宝贝。' },
+      { label: '常服算账', action: 'play', anim: '常服算账', text: '这笔账，奴才得好好算算……' },
+      { label: '府里数银', action: 'play', anim: '府里数银', text: '这一堆银子，都是奴才给您攒的！' },
+      { label: '塞银票', action: 'play', anim: '塞银票', text: '这银票，奴才替您收着……' },
+      { label: '常服进门', action: 'play', anim: '常服进门', text: '小月姑娘！小月姑娘——' },
+      { label: '银票打手', action: 'play', anim: '银票打手', text: '我怎么就管不住这手呢！' },
+      { label: '斗嘴', action: 'play', anim: '斗嘴', text: '皇上，奴才这张嘴可不饶人！' },
+    ],
+  },
+  work: {
+    label: '工作待机',
+    items: [
+      { label: '掏出钞票（0-24）', action: 'play', anim: '工作-掏出', loop: false },
+      { label: '点钞循环（25-85）', action: 'play', anim: '工作-循环' },
+      { label: '点完收钞（86-95）', action: 'play', anim: '工作-收起', loop: false },
+      { label: '收钞→待机过渡', action: 'play', anim: '工作-过渡', loop: false },
+      { label: '呼吸待机', action: 'play', anim: '待机-呼吸' },
+      { label: '捻须待机', action: 'play', anim: '待机-捻须' },
+      { label: '背手待机', action: 'play', anim: '待机-背手' },
+      { label: '打哈欠待机', action: 'play', anim: '待机-打哈欠' },
+      { label: '数朝珠待机', action: 'play', anim: '待机-数朝珠' },
+    ],
+  },
+  face: {
+    label: '表情',
+    items: Object.keys(FACE_LINES).map((face) => ({
+      label: face.slice(3),
+      action: 'face',
+      face,
+      text: FACE_LINES[face],
+    })),
+  },
+}
+
+let category = null
+let scale = 1
+let scaleDragging = false
+let throwSettleMs = 50
+let jailThreshold = 0
+
+const SETTLE_MIN = 50
+const SETTLE_MAX = 500
+
+async function refreshSnapshot() {
+  try {
+    const s = await window.heshen.readState()
+    scale = Math.max(0.7, Math.min(1.5, Number(s.scale) || 1))
+      throwSettleMs = Math.max(SETTLE_MIN, Math.min(SETTLE_MAX, Math.round(Number(s.throwSettleMs) || SETTLE_MIN)))
+    jailThreshold = Math.max(0, Math.min(10000, Math.round((Number(s.jailThreshold) || 0) * 100) / 100))
+  } catch {}
+}
+
+function el(tag, props = {}, children = []) {
+  const node = document.createElement(tag)
+  for (const [k, v] of Object.entries(props)) {
+    if (k === 'text') node.textContent = v
+    else if (k === 'className') node.className = v
+    else if (k.startsWith('data-')) node.setAttribute(k, v)
+    else node[k] = v
+  }
+  for (const c of children) node.appendChild(c)
+  return node
+}
+
+function resizeToContent() {
+  requestAnimationFrame(() => {
+    const height = Math.ceil(menu.getBoundingClientRect().height) + 2
+    window.heshen.resizeMenu(height)
+  })
+}
+
+function renderMain() {
+  category = null
+  menu.innerHTML = ''
+  menu.appendChild(el('div', { className: 'muted', text: '和大人' }))
+
+  const row = el('div', { className: 'scaleRow' })
+  row.appendChild(el('span', { text: '大小' }))
+  const range = el('input', {
+    type: 'range',
+    min: '70',
+    max: '150',
+    step: '5',
+    value: String(Math.round(scale * 100)),
+  })
+  const val = el('span', { id: 'scaleVal', text: `${Math.round(scale * 100)}%` })
+  range.addEventListener('input', () => {
+    scaleDragging = true
+    scale = Number(range.value) / 100
+    val.textContent = `${Math.round(scale * 100)}%`
+    window.heshen.menuAction({ action: 'scale', data: { scale } })
+  })
+  range.addEventListener('change', () => {
+    scaleDragging = false
+  })
+  row.appendChild(range)
+  row.appendChild(val)
+  menu.appendChild(row)
+
+  // 甩飞阈值：松手前静止/只在原地晃超过这么久就不甩飞（50–500ms）
+  const srow = el('div', { className: 'scaleRow' })
+  srow.title = '松手前指针静止（或只在原地小幅晃动）超过这个时长就不甩飞'
+  srow.appendChild(el('span', { text: '甩飞阈值' }))
+  const srange = el('input', {
+    type: 'range',
+    min: String(SETTLE_MIN),
+    max: String(SETTLE_MAX),
+    step: '10',
+    value: String(throwSettleMs),
+  })
+  const sval = el('span', { id: 'settleVal', text: `${throwSettleMs}ms` })
+  srange.addEventListener('input', () => {
+    throwSettleMs = Math.max(SETTLE_MIN, Math.min(SETTLE_MAX, Number(srange.value) || SETTLE_MIN))
+    sval.textContent = `${throwSettleMs}ms`
+    window.heshen.menuAction({ action: 'settle', data: { ms: throwSettleMs } })
+  })
+  srow.appendChild(srange)
+  srow.appendChild(sval)
+  menu.appendChild(srow)
+
+  menu.appendChild(
+    el('button', { className: 'cat', text: '与和大人说话 ', onclick: () => act({ action: 'chat' }) }),
+  )
+  menu.appendChild(
+    el('button', { className: 'cat', text: '查看国库 ', onclick: () => act({ action: 'treasury' }) }),
+  )
+  menu.appendChild(
+    el('button', {
+      className: 'cat',
+      text: `欠债阈值：${jailThreshold > 0 ? jailThreshold.toFixed(2) : '未设置'} `,
+      onclick: () => act({ action: 'jail-threshold' }),
+    }),
+  )
+  menu.appendChild(
+    el('button', { className: 'cat', text: '记忆账本 ', onclick: () => act({ action: 'memory' }) }),
+  )
+  menu.appendChild(el('div', { className: 'sep' }))
+
+  for (const [key, group] of Object.entries(TREE)) {
+    const btn = el('button', { className: 'cat', text: group.label })
+    btn.appendChild(el('span', { text: '›' }))
+    btn.addEventListener('click', () => {
+      category = key
+      renderSub()
+    })
+    menu.appendChild(btn)
+  }
+
+  menu.appendChild(el('div', { className: 'sep' }))
+  const quit = el('button', { className: 'cat', text: '退出桌宠 ', onclick: () => act({ action: 'quit' }) })
+  quit.appendChild(el('span', { text: '›' }))
+  menu.appendChild(quit)
+  resizeToContent()
+}
+
+function renderSub() {
+  const group = TREE[category]
+  if (!group) return renderMain()
+  menu.innerHTML = ''
+  const back = el('button', { className: 'muted', text: `‹ ${group.label}` })
+  back.addEventListener('click', () => renderMain())
+  menu.appendChild(back)
+  for (const item of group.items) {
+    const btn = el('button', { text: item.label })
+    btn.addEventListener('click', () =>
+      act({
+        action: item.action,
+        data: {
+          anim: item.anim,
+          face: item.face,
+          text: item.text,
+          // 只有「待机/循环」类动作循环播放，其余动作播一遍就回待机
+          loop: item.loop !== undefined ? item.loop : LOOPING_ANIMS.has(item.anim),
+        },
+      }),
+    )
+    menu.appendChild(btn)
+  }
+  resizeToContent()
+}
+
+function act(payload) {
+  window.heshen.menuAction(payload)
+}
+
+window.heshen.onMenuOpened(async () => {
+  await refreshSnapshot()
+  renderMain()
+  scaleDragging = false
+})
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') window.heshen.closeMenu()
+})
+window.addEventListener('contextmenu', (e) => e.preventDefault())
+
+async function boot() {
+  await refreshSnapshot()
+  renderMain()
+}
+boot()
+</script>
+</body>
+</html>

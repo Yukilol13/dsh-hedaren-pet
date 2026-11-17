@@ -1,0 +1,5 @@
+- insert:
+    - id: heshen-desktop-pet
+      name: '@local/heshen-desktop-pet'
+      config:
+        alwaysOnTop: true

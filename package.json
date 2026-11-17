@@ -1,0 +1,43 @@
+{
+  "name": "dsh-hedaren-pet",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "和大人桌面宠物（DeepSeek Harness 插件）：Q 版两头身清朝权臣，自带透明 Electron 窗口、全套 C 版动画与表情、三层记忆聊天人格，还会抽成国库、网住大肥鱼，国库亏空时把自己关进牢房。",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "desktop-pet",
+    "electron",
+    "和大人"
+  ],
+  "author": "Yukilol13",
+  "license": "MIT",
+  "homepage": "https://github.com/Yukilol13/dsh-hedaren-pet",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Yukilol13/dsh-hedaren-pet.git"
+  },
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "memory.js",
+    "dshpet.js",
+    "persona.md",
+    "cordis.patch.yml",
+    "app",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
