@@ -516,6 +516,16 @@ function applyState(next) {
   }
 }
 
+// 鼠标一移到和大人身上就预扫大肥鱼：给「准备甩」的那几百毫秒留出扫描时间。
+// 主进程对 fish:prefetch 有 600ms 节流，这里再按 1.2s 卡一下，不会刷屏。
+let hoverPrefetchAt = 0
+window.addEventListener('mouseenter', () => {
+  const now = performance.now()
+  if (now - hoverPrefetchAt < 1200) return
+  hoverPrefetchAt = now
+  window.heshen.prefetchFish?.()
+})
+
 // 拖动 + 松手弹射（按加速度判定）
 window.addEventListener('mousedown', (e) => {
   if (e.button !== 0) return

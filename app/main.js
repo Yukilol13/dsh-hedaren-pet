@@ -780,6 +780,7 @@ function runCapture(slot, svx, svy, forced) {
     fishPresent = false
     fishEverSeen = true
     fishDetectRect = null
+    fishSlots = []
     fishDetectAt = Date.now()
     void hideFishNow()
   } else if (verdict.result === 'hidden') {
@@ -921,18 +922,13 @@ function throwWindow(vx, vy) {
     if (!captureLock) {
       // 她可能同时画在桌面窗口和网页（DSH 窗口）里：每个扫到的框都算一遍。
       // 扫描结果超过 2.5 秒就作废并立刻重扫——切换 display 之后旧的框不能再用来判捕捉
-      const stale = Date.now() - fishDetectAt > 1500
-      if (stale && !fishDetecting) void detectFish()
-      const slots = stale
-        ? []
-        : fishSlots.length
-          ? fishSlots
-          : fishSlotRect()
-            ? [fishSlotRect()]
-            : []
+      // 她几乎不动（实测整场只在 ~30px 内漂），「过期但存在」的槽位照样能用；
+      // 只有「刚扫过且明确没扫到」才算不在。以前一律丢弃，导致大量甩飞在无槽位状态下必 miss。
+      if (Date.now() - fishDetectAt > 1500 && !fishDetecting) void detectFish()
+      const slots = fishSlots.length ? fishSlots : fishSlotRect() ? [fishSlotRect()] : []
       if (slots.length) {
         const ink = { x: Math.round(x) + 4, y: Math.round(y) + 4, w: width - 8, h: height - 8 }
-        const hit = slots.find((s) => capture.rectsOverlap(ink, s, -12))
+        const hit = slots.find((s) => capture.rectsOverlap(ink, s, 10))
         if (hit) {
           runCapture(hit, svx, svy)
           return

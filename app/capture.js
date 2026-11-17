@@ -4,9 +4,9 @@
  * 纯数据 + 纯函数，方便单测；主进程只负责按结果播动作、说台词、写状态。
  */
 
-/** 失败概率区间：20%–50%，飞得越快越容易失手 */
-const FAIL_MIN = 0.2
-const FAIL_MAX = 0.5
+/** 失败概率区间：10%–25%，飞得越快越容易失手 */
+const FAIL_MIN = 0.1
+const FAIL_MAX = 0.25
 /** 速度映射区间（px/s）：低于 SLOW 按 20%，高于 FAST 按 50% */
 const SPEED_SLOW = 600
 const SPEED_FAST = 3200
@@ -56,7 +56,7 @@ const HIDDEN_BLAME_LINES = [
 ]
 
 /**
- * 本次碰撞的失败概率：速度越快越高，夹在 20%–50%。
+ * 本次碰撞的失败概率：速度越快越高，夹在 10%–25%。
  * @param {number} speed px/s
  */
 function failChance(speed) {
