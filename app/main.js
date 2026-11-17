@@ -8,7 +8,8 @@ const {
   nativeImage,
 } = require('electron')
 const fs = require('node:fs')
-const { execFile } = require('node:child_process')
+const { execFile, spawn } = require('node:child_process')
+const readline = require('node:readline')
 const path = require('node:path')
 const os = require('node:os')
 
@@ -491,6 +492,126 @@ async function captureScreens() {
 }
 
 /**
+ * 常驻抓图进程（只 Windows）。
+ *
+ * 为什么需要它：每次扫描都 spawn 一个 PowerShell，实测要 ~1.4 秒（进程启动 0.9s +
+ * System.Drawing 0.35s + 编译）。甩飞是「松手就飞」，等不起 1.4 秒，于是起飞那一刻
+ * 手上只有配置推算的旧框、或者干脆没有框（日志里的 `slots=none`），甩得快就从她
+ * 身上穿过去了。常驻之后：进程只启动一次、DLL 只加载一次，之后一次抓图实测 35~40ms，
+ * 甩飞前可以直接等这批坐标齐了再起飞。
+ */
+let captureDaemon = null
+let captureDaemonSeq = 0
+let captureDaemonIdle = 0
+const CAPTURE_DAEMON_IDLE_MS = 5 * 60 * 1000
+
+function stopCaptureDaemon(reason) {
+  if (captureDaemonIdle) {
+    clearTimeout(captureDaemonIdle)
+    captureDaemonIdle = 0
+  }
+  const d = captureDaemon
+  captureDaemon = null
+  if (!d) return
+  for (const pending of d.pending.values()) pending.resolve(null)
+  d.pending.clear()
+  try {
+    if (!d.proc.killed) d.proc.stdin.write('quit\n')
+  } catch {}
+  try {
+    d.proc.kill()
+  } catch {}
+  if (reason) log(`capture daemon stopped: ${reason}`)
+}
+
+/** 启动（或复用）常驻抓图进程；返回 {proc, pending} */
+function startCaptureDaemon() {
+  if (captureDaemon) return captureDaemon
+  const script = path.join(__dirname, 'print_pets.ps1')
+  if (!fs.existsSync(script)) return null
+  let proc
+  try {
+    proc = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-Daemon'],
+      { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] },
+    )
+  } catch (error) {
+    log(`capture daemon spawn failed ${error?.message || error}`)
+    return null
+  }
+  const d = { proc, pending: new Map() }
+  const rl = readline.createInterface({ input: proc.stdout })
+  rl.on('line', (line) => {
+    const text = String(line || '').trim()
+    if (!text) return
+    let msg
+    try {
+      msg = JSON.parse(text)
+    } catch {
+      return
+    }
+    const pending = d.pending.get(String(msg?.id))
+    if (!pending) return
+    d.pending.delete(String(msg.id))
+    const items = Array.isArray(msg.items) ? msg.items : msg.items ? [msg.items] : []
+    pending.resolve(items.filter((w) => w && Number.isFinite(Number(w.x)) && w.png))
+  })
+  const fail = (why) => {
+    for (const pending of d.pending.values()) pending.resolve(null)
+    d.pending.clear()
+    if (captureDaemon === d) {
+      captureDaemon = null
+      log(`capture daemon gone (${why})`)
+    }
+  }
+  proc.on('error', (error) => fail(error?.message || 'error'))
+  proc.on('exit', (code) => fail(`exit ${code}`))
+  proc.stderr.on('data', (buf) => {
+    const text = String(buf || '').trim()
+    if (text) log(`capture daemon stderr ${text.slice(0, 200)}`)
+  })
+  captureDaemon = d
+  log('capture daemon started')
+  return d
+}
+
+/** 让常驻进程抓一次；失败/超时返回 null，调用方回退一次性脚本 */
+function daemonGrab(timeout = 3000) {
+  const d = startCaptureDaemon()
+  if (!d) return Promise.resolve(null)
+  const id = String(++captureDaemonSeq)
+  return new Promise((resolve) => {
+    let done = false
+    const finish = (value) => {
+      if (done) return
+      done = true
+      d.pending.delete(id)
+      if (captureDaemonIdle) clearTimeout(captureDaemonIdle)
+      captureDaemonIdle = setTimeout(() => {
+        if (captureDaemon && captureDaemon.pending.size === 0) stopCaptureDaemon('idle')
+      }, CAPTURE_DAEMON_IDLE_MS)
+      resolve(value)
+    }
+    d.pending.set(id, { resolve: finish })
+    try {
+      d.proc.stdin.write(`grab ${id}\n`)
+    } catch (error) {
+      log(`capture daemon write failed ${error?.message || error}`)
+      finish(null)
+      stopCaptureDaemon('write failed')
+      return
+    }
+    setTimeout(() => {
+      if (done) return
+      log(`capture daemon timeout ${timeout}ms`)
+      finish(null)
+      stopCaptureDaemon('timeout')
+    }, timeout)
+  })
+}
+
+/**
  * Windows：用 PowerShell + PrintWindow 只拍 dsh-pet 的桌宠窗口（按标题精确匹配）。
  *
  * 为什么 Windows 必须这么走：整屏截图（desktopCapturer 的 screen 源）实测一次要
@@ -537,7 +658,13 @@ async function probePetsPrintWindow(timeout = 8000) {
  *   ScreenCaptureKit 的窗口列表里也常常没有它，按标题找窗口永远找不到鱼。
  */
 async function probePetWindows(timeout = 8000) {
-  if (process.platform === 'win32') return probePetsPrintWindow(timeout)
+  if (process.platform === 'win32') {
+    // 优先常驻进程（实测 35~40ms）；它挂了/超时再回退一次性脚本（~1.4s）
+    // 注意 [] 是「抓到了，但没有目标窗口」，不等于失败，别拿它回退
+    const viaDaemon = await daemonGrab(Math.min(timeout, 3000))
+    if (Array.isArray(viaDaemon)) return viaDaemon
+    return probePetsPrintWindow(timeout)
+  }
   return captureScreens(timeout)
 }
 
@@ -760,6 +887,28 @@ async function detectFish() {
   } finally {
     fishDetecting = false
   }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * 起飞前把大肥鱼的框准备好。
+ *
+ * 以前这里只是「顺手发一个异步扫描」就开始飞行：一次性 PowerShell 要 1.4 秒，
+ * 飞快的那一下早就从她身上穿过去了。常驻进程把单次抓图压到 ~40ms 之后，
+ * 这里可以真的等一等——最多等 maxWait，扫不出来就照旧用旧框飞。
+ */
+async function ensureFishSlots(maxWait = 400) {
+  if (!fishGateOpen) return
+  const t0 = Date.now()
+  if (fishDetecting) {
+    while (fishDetecting && Date.now() - t0 < maxWait) await sleep(15)
+    return
+  }
+  if (fishDetectAt && Date.now() - fishDetectAt <= 400) return
+  await Promise.race([detectFish(), sleep(maxWait)])
 }
 
 /** 撞上大肥鱼之前，网络是不是该自己先收网：把大肥鱼立刻关掉（不等插件轮询） */
@@ -1230,9 +1379,15 @@ ipcMain.on('pet:metrics', (_event, payload) => {
   syncSatellites()
 })
 
-ipcMain.on('win:throw', (_event, vx, vy) => {
+ipcMain.on('win:throw', async (_event, vx, vy) => {
   if (!win) return
   log(`throw request vx=${Math.round(vx)} vy=${Math.round(vy)}`)
+  // 起飞前等一次新鲜坐标（常驻进程下 ~40ms）：否则飞快了会从她身上穿过去
+  const waitFrom = Date.now()
+  await ensureFishSlots(400)
+  const waited = Date.now() - waitFrom
+  if (waited > 60) log(`throw waited ${waited}ms for fresh fish slots`)
+  if (!win) return
   throwWindow(vx, vy)
 })
 ipcMain.on('win:throwSkip', (_event, info) => {
@@ -1437,6 +1592,7 @@ if (!gotLock) {
   app.on('will-quit', () => {
     if (visibilityTimer) clearInterval(visibilityTimer)
     if (sayTimer) clearTimeout(sayTimer)
+    stopCaptureDaemon('app quit')
     tray?.destroy()
   })
 }

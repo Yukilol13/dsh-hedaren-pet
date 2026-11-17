@@ -80,10 +80,13 @@ dsh-hedaren-pet/
 抓法按平台分两条，选型理由是**主线程开销**：
 
 - **Windows**：`app/print_pets.ps1` 枚举标题含「dsh-pet 桌宠」「DeepSeek Harness」的窗口，
-  用 `PrintWindow(PW_RENDERFULLCONTENT)` 逐窗口抓 1:1 客户区（`probePetsPrintWindow`）。
-  抓图跑在 PowerShell 子进程里，主线程只解码一张窗口大小的 PNG 再扫（实测 10~25 ms）。
-  实测整屏 `desktopCapturer` 一次要 ~500 ms 且**全程阻塞 Electron 主线程**，
-  投掷飞行中触发重扫就是肉眼可见的卡顿，所以 Windows 不走那条路。
+  用 `PrintWindow(PW_RENDERFULLCONTENT)` 逐窗口抓 1:1 客户区。
+  抓图跑在 **常驻 PowerShell 进程**里（`-Daemon`，C# 编译结果缓存成 DLL 只加载一次），
+  主线程只解码一张窗口大小的 PNG 再扫（实测 10~25 ms）。实测：
+  整屏 `desktopCapturer` 一次 ~500 ms 且**全程阻塞 Electron 主线程**；
+  一次性 PowerShell 一次 ~1.4 s；常驻进程之后一次抓图只要 **35~67 ms**。
+  甩飞是「松手就飞」，等 1.4 秒等于前 1.4 秒没有任何碰撞框（飞快了直接从她身上穿过去），
+  所以起飞前会 `await` 最多 400 ms 拿一批新鲜坐标（通常 40~90 ms 就够）。
 - **macOS / Linux**：整屏截图（`captureScreens`，每个显示器一张）。这两边的桌面 helper 是
   `app.dock.hide()` 的透明窗口：System Events 只枚举 `background only = false` 的进程，
   ScreenCaptureKit 的窗口列表里也常常没有它，按标题找永远找不到，只能整屏扫。

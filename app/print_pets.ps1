@@ -1,6 +1,18 @@
-﻿param([string]$Out = "$env:TEMP\heshen-pets")
+﻿param(
+  [string]$Out = "$env:TEMP\heshen-pets",
+  [switch]$Daemon
+)
+
+# 把 C# 编译一次、缓存成 DLL，之后每次只 -Path 加载。
+# 实测：现场 Add-Type -TypeDefinition 要 ~100-250ms，缓存后加载几乎免费；
+# 但 PowerShell 进程启动本身就要 ~900ms，所以真正省时间的是 -Daemon 常驻模式
+# （插件端 spawn 一次后反复收发命令，单次抓图 ~50-150ms）。
 Add-Type -AssemblyName System.Drawing
-Add-Type -TypeDefinition @"
+
+$CacheDir = Join-Path $env:TEMP 'heshen-pet-cache'
+$DllPath = Join-Path $CacheDir 'HeshenPetWin.dll'
+
+$Source = @"
 using System;
 using System.Text;
 using System.Collections.Generic;
@@ -56,14 +68,77 @@ public class PetWin {
     return items;
   }
 }
-"@ -ReferencedAssemblies System.Drawing
-New-Item -ItemType Directory -Force -Path $Out | Out-Null
-Get-ChildItem $Out -Filter '*.png' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-$items = New-Object System.Collections.ArrayList
-foreach ($it in [PetWin]::Grab('dsh-pet 桌宠', $Out, 'pet', 0)) { [void]$items.Add($it) }
-foreach ($it in [PetWin]::Grab('DeepSeek Harness', $Out, 'page', 0)) { [void]$items.Add($it) }
-$list = @()
-foreach ($it in $items) {
-  $list += [pscustomobject]@{ kind = $it.kind; title = $it.title; x = $it.x; y = $it.y; w = $it.w; h = $it.h; png = $it.png }
+"@
+
+# 脚本改过（或 DLL 不存在 / 被清掉）就重编；脚本比 DLL 新 → 重编
+$scriptPath = $PSCommandPath
+if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
+$needBuild = $true
+if (Test-Path $DllPath) {
+  try {
+    $dllTime = (Get-Item $DllPath).LastWriteTimeUtc
+    $srcTime = (Get-Item $scriptPath).LastWriteTimeUtc
+    if ($dllTime -gt $srcTime) { $needBuild = $false }
+  } catch { $needBuild = $true }
 }
-ConvertTo-Json -InputObject $list -Compress -Depth 4
+
+if ($needBuild) {
+  New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+  $tmpDll = Join-Path $CacheDir ('HeshenPetWin.' + $PID + '.tmp.dll')
+  Remove-Item $tmpDll -Force -ErrorAction SilentlyContinue
+  try {
+    Add-Type -TypeDefinition $Source -ReferencedAssemblies System.Drawing -OutputAssembly $tmpDll -OutputType Library
+    Move-Item -Force $tmpDll $DllPath
+  } catch {
+    Remove-Item $tmpDll -Force -ErrorAction SilentlyContinue
+    $DllPath = ''
+  }
+}
+
+if ($DllPath) {
+  try { Add-Type -Path $DllPath } catch { Add-Type -TypeDefinition $Source -ReferencedAssemblies System.Drawing }
+} else {
+  Add-Type -TypeDefinition $Source -ReferencedAssemblies System.Drawing
+}
+
+function Invoke-Grab {
+  New-Item -ItemType Directory -Force -Path $Out | Out-Null
+  Get-ChildItem $Out -Filter '*.png' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+  $items = New-Object System.Collections.ArrayList
+  foreach ($it in [PetWin]::Grab('dsh-pet 桌宠', $Out, 'pet', 0)) { [void]$items.Add($it) }
+  foreach ($it in [PetWin]::Grab('DeepSeek Harness', $Out, 'page', 0)) { [void]$items.Add($it) }
+  $list = @()
+  foreach ($it in $items) {
+    $list += [pscustomobject]@{ kind = $it.kind; title = $it.title; x = $it.x; y = $it.y; w = $it.w; h = $it.h; png = $it.png }
+  }
+  return ,$list
+}
+
+if ($Daemon) {
+  # 常驻模式：stdin 每行一条命令 —— 「grab <id>」抓一次，「quit」退出。
+  # stdout 每行一条 JSON：{"id":"<id>","items":[...]}（items 可能是空数组）
+  # 输出统一 UTF-8：默认走系统 GBK 代码页，窗口标题里的中文到 Node 那边会变乱码
+  try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
+  $stdIn = [Console]::In
+  $stdOut = [Console]::Out
+  while ($true) {
+    $line = $stdIn.ReadLine()
+    if ($null -eq $line) { break }
+    $line = $line.Trim()
+    if ($line -eq '') { continue }
+    if ($line -eq 'quit') { break }
+    if ($line -like 'grab*') {
+      $parts = $line.Split(' ')
+      $id = if ($parts.Length -gt 1) { $parts[1] } else { '0' }
+      $list = Invoke-Grab
+      $payload = New-Object psobject
+      $payload | Add-Member -NotePropertyName id -NotePropertyValue $id
+      $payload | Add-Member -NotePropertyName items -NotePropertyValue @($list)
+      $stdOut.WriteLine((ConvertTo-Json -InputObject $payload -Compress -Depth 5))
+      $stdOut.Flush()
+    }
+  }
+  exit 0
+}
+
+ConvertTo-Json -InputObject (Invoke-Grab) -Compress -Depth 4
