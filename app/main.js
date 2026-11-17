@@ -487,20 +487,48 @@ async function captureScreens() {
 }
 
 /**
- * 取当前屏幕上的画面（每屏一张），供 detectFish 扫蓝毛。
+ * Windows：用 PowerShell + PrintWindow 只拍 dsh-pet 的桌宠窗口（按标题精确匹配）。
+ * 产物是每窗口一张 1:1 客户区 PNG，x/y 由 ClientToScreen 给出（PowerShell 进程
+ * 非 DPI-aware，返回的就是 DIP，和 Electron 的 bounds 同一坐标系），所以 scale=1。
+ */
+async function probePetsPrintWindow(timeout = 8000) {
+  const script = path.join(__dirname, 'print_pets.ps1')
+  if (!fs.existsSync(script)) return []
+  return new Promise((resolve) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script],
+      { timeout, windowsHide: true, maxBuffer: 1 << 20 },
+      (error, stdout) => {
+        if (error) {
+          log(`pet window probe failed ${error?.message || error}`)
+          resolve([])
+          return
+        }
+        try {
+          const parsed = JSON.parse(String(stdout).trim() || '[]')
+          const list = Array.isArray(parsed) ? parsed : [parsed]
+          resolve(list.filter((w) => w && Number.isFinite(Number(w.x)) && w.png))
+        } catch {
+          resolve([])
+        }
+      },
+    )
+  })
+}
+
+/**
+ * 取当前屏幕上的画面，供 detectFish 扫蓝毛。
  *
- * 历史：这里原本按窗口标题找 dsh-pet 的桌宠窗口，Windows 走 PrintWindow、
- * macOS/Linux 走 System Events + desktopCapturer 的 window 源。两条路都要求
- * 「先按标题找到窗口」，而 dsh-pet 的桌面 helper 恰恰是最难被找到的窗口
- * （dock-hidden、透明、无边框）。现在统一成整屏截图，见 captureScreens。
+ * Windows 走 PrintWindow：只拍标题含「dsh-pet 桌宠」「DeepSeek Harness」的窗口，
+ * 像素里除了这两个窗口没有别的东西，不会把 DSH 网页 UI 里的蓝色文字当成大肥鱼。
+ *
+ * macOS / Linux 走整屏截图（captureScreens）：那边的桌面 helper 是 dock-hidden 的
+ * 透明窗口，System Events 只枚举 background only=false 的进程、ScreenCaptureKit 的
+ * 窗口列表里也常常没有它，按标题找窗口永远找不到鱼。整屏截图不依赖窗口枚举。
  */
 async function probePetWindows(timeout = 8000) {
-  // 全平台统一：整屏截图。「按窗口标题找她」那条路整个退役。
-  // 它在任何一个平台上都不稳：dsh-pet 的桌面 helper 是 dock-hidden 的透明窗口，
-  // macOS 的 System Events 只枚举 background only=false 的进程，ScreenCaptureKit 的
-  // 窗口列表里也常常没有它；Windows 的 PrintWindow 同样得先按标题找到窗口。
-  // 任何一环断了，鱼就"凭空消失"。整屏截图不依赖窗口枚举：鱼画在哪个表面、
-  // 画了几只，扫像素一视同仁。
+  if (process.platform === 'win32') return probePetsPrintWindow(timeout)
   return captureScreens(timeout)
 }
 
