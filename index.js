@@ -881,7 +881,7 @@ export function apply(ctx, rawConfig = {}) {
               const live = pets && typeof pets === 'object' ? pets : {}
               const pos = Object.keys(live).join(',')
               text =
-                `大肥鱼：${t.ok ? (t.visible ? '在网页里' : '不在显示范围') : `定位失败（${t.reason || '未知'}）`}\n` +
+                `大肥鱼：${t.ok ? (t.visible ? (t.surface === 'desktop' ? '在桌面窗口里' : '在网页里') : '不在显示范围') : `定位失败（${t.reason || '未知'}）`}\n` +
                 `框：${t.rect ? `${t.rect.x},${t.rect.y} ${t.rect.w}×${t.rect.h}` : '无'}\n` +
                 `DSH 窗口：${t.window ? `${t.window.x},${t.window.y} ${t.window.w}×${t.window.h} dpi=${t.window.dpi}` : '无'}\n` +
                 `接口状态：${value.petState?.status || '无'}（宿主内部路由，不走 HTTP 鉴权）· pets=${pos || '无'}\n` +

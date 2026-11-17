@@ -39,7 +39,7 @@ const APOLOGY_LINES = [
   '请主子责罚！奴才回头就去渔具铺子重新置办，下回定不给主子丢人。',
 ]
 
-/** 失手且速度过快：怪老纪催命 */
+/** 失手且速度过快：怪老纪催命（也会混进普通失手的台词池） */
 const BLAME_LINES = [
   '老纪你着什么急！都怪你！要不是你在旁边催，奴才这一网能偏吗！',
   '（跺脚）纪大烟袋你少啰嗦！你一句"快点"，奴才这网就撒歪了！',
@@ -122,7 +122,11 @@ function pickLine(lines, random = Math.random) {
   return lines[Math.min(lines.length - 1, Math.floor(random() * lines.length))]
 }
 
+/** 捕鱼失败的全部台词：普通失手 + 数落老纪，混在一个池子里随机 */
+const FAIL_LINES = [...APOLOGY_LINES, ...BLAME_LINES]
+
 module.exports = {
+  FAIL_LINES,
   FISH_BOX,
   rectFromManual,
   FAIL_MIN,

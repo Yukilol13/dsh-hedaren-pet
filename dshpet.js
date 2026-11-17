@@ -388,8 +388,12 @@ export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
     else x = Math.round(right - marginX - w)
     const y = Math.round(win.y + marginY)
     const rect = { x, y, w, h }
+    // desktop（含 both）下，宠物是相对**屏幕工作区**按角落摆的，拿 DSH 窗口当尺子
+    // 会把明明在屏幕上的她判成「不在显示范围」。这个表面的真实可见性由窗口侧
+    // 的像素判定负责：屏幕上扫到她，才算看见。
     const inWindow =
-      rect.x + rect.w > win.x && rect.x < win.x + win.w && rect.y + rect.h > win.y && rect.y < win.y + win.h
+      surface === 'desktop' ||
+      (rect.x + rect.w > win.x && rect.x < win.x + win.w && rect.y + rect.h > win.y && rect.y < win.y + win.h)
     return {
       ok: true,
       pet: { id: pet.id, name: pet.name || '', display, size },

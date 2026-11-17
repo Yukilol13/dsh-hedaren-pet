@@ -399,7 +399,23 @@ function configSlotRect() {
   if (!t || !t.rect) return null
   const r = t.rect
   if (![r.x, r.y, r.w, r.h].every((v) => Number.isFinite(Number(v)))) return null
-  return { x: Number(r.x), y: Number(r.y), w: Number(r.w), h: Number(r.h) }
+  const box = { x: Number(r.x), y: Number(r.y), w: Number(r.w), h: Number(r.h) }
+  // desktop 表面（含 both）下，dsh-pet 的宠物是相对**屏幕工作区**按角落摆的，不是相对 DSH 窗口。
+  // host（dshpet.js）拿不到屏幕几何，只能按窗口算，算出来的框会整体偏左上
+  // （实测 1018,185 vs 真实 1242,133）。这里用「窗口右缘到框右缘」还原 marginX，
+  // 再以工作区为锚重算，both 也一并按桌面那份算。
+  if (t.surface === 'desktop' && t.window && Number.isFinite(Number(t.window.w))) {
+    const wa = screen.getPrimaryDisplay().workArea
+    const marginX = Number(t.window.x) + Number(t.window.w) - (box.x + box.w)
+    const marginY = box.y - Number(t.window.y)
+    return {
+      x: Math.round(wa.x + wa.width - marginX - box.w),
+      y: Math.round(wa.y + marginY),
+      w: box.w,
+      h: box.h,
+    }
+  }
+  return box
 }
 
 /**
@@ -421,88 +437,71 @@ function fishSlotRect() {
 }
 
 /**
- * 抓每个桌宠窗口「窗口自己画的内容」+ 客户区位置（DIP）。
+ * 整屏截图兜底：每个显示器一张，位置用 bounds（DIP），内容用 desktopCapturer。
  *
- * - **Windows**：PowerShell PrintWindow 存 PNG（透明窗直接截屏会把背后内容拍进来，PrintWindow 只取窗口自己）
- * - **macOS / Linux**：Electron `desktopCapturer` 抓单个窗口的缩略图（macOS 需要「屏幕录制」权限），
- *   位置由 `winprobe` 给；两边的尺寸不一定 1:1，所以顺带返回 scaleX/scaleY 用来换算像素框
- *
- * 结果每项：{ kind, title, x, y, w, h, png?|image?, scaleX?, scaleY? }
+ * 为什么 macOS 需要它：dsh-pet 的桌面 helper 是 `app.dock.hide()` 的透明窗口，
+ * - System Events 侧：探测脚本只枚举 `background only = false`，helper 被当成后台进程跳过；
+ * - ScreenCaptureKit 侧：`getSources({types:['window']})` 的窗口列表里常常根本没有它。
+ * 两条路都断，按标题找窗口就永远找不到鱼。整屏截图不依赖窗口枚举，
+ * 蓝毛在哪都扫得到，扫出来的框本来也直接是屏幕 DIP。
  */
-async function probePetWindows(timeout = 8000) {
-  if (process.platform === 'win32') {
-    const script = path.join(__dirname, 'print_pets.ps1')
-    if (!fs.existsSync(script)) return []
-    return new Promise((resolve) => {
-      execFile(
-        'powershell.exe',
-        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script],
-        { timeout, windowsHide: true, maxBuffer: 1 << 20 },
-        (error, stdout) => {
-          if (error) {
-            log(`pet window probe failed ${error?.message || error}`)
-            resolve([])
-            return
-          }
-          try {
-            const parsed = JSON.parse(String(stdout).trim() || '[]')
-            const list = Array.isArray(parsed) ? parsed : [parsed]
-            resolve(list.filter((w) => w && Number.isFinite(Number(w.x)) && w.png))
-          } catch {
-            resolve([])
-          }
-        },
-      )
-    })
-  }
-
-  // macOS / Linux：位置用 winprobe，内容用 desktopCapturer
+async function captureScreens() {
   try {
     const { desktopCapturer } = require('electron')
-    const scale = (screen.getPrimaryDisplay().scaleFactor || 1)
-    const list = []
-    for (const item of [
-      { needle: 'dsh-pet 桌宠', kind: 'pet' },
-      { needle: 'DeepSeek Harness', kind: 'page' },
-    ]) {
-      const probe = await winprobe.listWindows(item.needle, { timeout, scale })
-      if (!probe.windows.length) continue
-      const maxW = Math.min(1920, Math.max(...probe.windows.map((w) => w.w)))
-      const maxH = Math.min(1080, Math.max(...probe.windows.map((w) => w.h)))
-      const sources = await desktopCapturer.getSources({
-        types: ['window'],
-        thumbnailSize: { width: maxW, height: maxH },
-        fetchWindowIcons: false,
+    const displays = screen.getAllDisplays()
+    if (!displays.length) return []
+    const maxW = Math.min(1920, Math.max(...displays.map((d) => d.size.width)))
+    const maxH = Math.min(1080, Math.max(...displays.map((d) => d.size.height)))
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: maxW, height: maxH },
+      fetchWindowIcons: false,
+    })
+    const out = []
+    for (const src of sources) {
+      const thumb = src.thumbnail
+      if (!thumb || thumb.isEmpty()) continue
+      const ts = thumb.getSize()
+      if (!ts.width || !ts.height) continue
+      const disp =
+        displays.find((d) => String(d.id) === String(src.display_id)) || screen.getPrimaryDisplay()
+      const b = disp.bounds
+      out.push({
+        kind: 'pet',
+        title: src.name || 'screen',
+        x: Math.round(b.x),
+        y: Math.round(b.y),
+        w: Math.round(b.width),
+        h: Math.round(b.height),
+        image: thumb,
+        // 缩略图不保证 1:1，横竖分开换算；slot 计算会按这两个系数还原成 DIP
+        scaleX: b.width / ts.width,
+        scaleY: b.height / ts.height,
       })
-      const matches = sources.filter((src) => src.name && src.name.includes(item.needle) && !src.thumbnail.isEmpty())
-      if (!matches.length) {
-        log(`window capture unavailable（${item.needle}）：拍不到窗口内容（macOS 请在系统设置里给 Electron「屏幕录制」权限）`)
-        continue
-      }
-      const n = Math.min(matches.length, probe.windows.length)
-      for (let i = 0; i < n; i++) {
-        const win = probe.windows[i]
-        const thumb = matches[i].thumbnail
-        const ts = thumb.getSize()
-        if (!ts.width || !ts.height || !win.w || !win.h) continue
-        list.push({
-          kind: item.kind,
-          title: win.title,
-          x: win.x,
-          y: win.y,
-          w: win.w,
-          h: win.h,
-          image: thumb,
-          scaleX: win.w / ts.width,
-          scaleY: win.h / ts.height,
-        })
-      }
     }
-    return list
+    return out
   } catch (error) {
-    log(`pet window probe failed ${error?.message || error}`)
+    log(`screen capture failed ${error?.message || error}`)
     return []
   }
+}
+
+/**
+ * 取当前屏幕上的画面（每屏一张），供 detectFish 扫蓝毛。
+ *
+ * 历史：这里原本按窗口标题找 dsh-pet 的桌宠窗口，Windows 走 PrintWindow、
+ * macOS/Linux 走 System Events + desktopCapturer 的 window 源。两条路都要求
+ * 「先按标题找到窗口」，而 dsh-pet 的桌面 helper 恰恰是最难被找到的窗口
+ * （dock-hidden、透明、无边框）。现在统一成整屏截图，见 captureScreens。
+ */
+async function probePetWindows(timeout = 8000) {
+  // 全平台统一：整屏截图。「按窗口标题找她」那条路整个退役。
+  // 它在任何一个平台上都不稳：dsh-pet 的桌面 helper 是 dock-hidden 的透明窗口，
+  // macOS 的 System Events 只枚举 background only=false 的进程，ScreenCaptureKit 的
+  // 窗口列表里也常常没有它；Windows 的 PrintWindow 同样得先按标题找到窗口。
+  // 任何一环断了，鱼就"凭空消失"。整屏截图不依赖窗口枚举：鱼画在哪个表面、
+  // 画了几只，扫像素一视同仁。
+  return captureScreens(timeout)
 }
 
 /**
@@ -535,7 +534,7 @@ function scanImage(img, kind = 'pet') {
         }
       }
     }
-    let best = null
+    const blobs = []
     const seen = new Uint8Array(w * h)
     const stack = new Int32Array(w * h)
     for (let seed = 0; seed < mask.length; seed++) {
@@ -585,19 +584,21 @@ function scanImage(img, kind = 'pet') {
       const maxW = 460
       const maxH = 520
       if (count < minCount || bw < minW || bh < minH || bw > maxW || bh > maxH) continue
-      if (!best || count > best.count) best = { count, bx0, by0, bw, bh }
+      blobs.push({ count, bx0, by0, bw, bh })
     }
-    if (!best) return { hits, rect: null }
+    if (!blobs.length) return { hits, rect: null, rects: [] }
+    // 画面里可能同时有多只大肥鱼：display=both 时网页一份、桌面一份，
+    // 配置里也可能养了多只。每个合格连通块都留一个框，撞上任意一只就算捕到。
+    blobs.sort((a, b) => b.count - a.count)
     const margin = 30
-    return {
-      hits: best.count,
-      rect: {
-        x: best.bx0 - margin,
-        y: best.by0 - margin,
-        w: Math.round(best.bw + margin * 2),
-        h: Math.round(best.bh + margin * 2),
-      },
-    }
+    const rects = blobs.map((b) => ({
+      x: b.bx0 - margin,
+      y: b.by0 - margin,
+      w: Math.round(b.bw + margin * 2),
+      h: Math.round(b.bh + margin * 2),
+      hits: b.count,
+    }))
+    return { hits: rects[0].hits, rect: rects[0], rects }
   } catch (error) {
     log(`fish scan failed ${error?.message || error}`)
     return null
@@ -621,6 +622,17 @@ function scanPng(pngPath, kind = 'pet') {
  * 找大肥鱼：逐个桌宠窗口取内容，再在每张图里找「蓝毛连通块」。
  * 找到就把「窗口位置 + 块包围盒」换算成屏幕 DIP 当碰撞框；一个都没找到 = 她不在画面上（撞击必失手）。
  */
+/** 一个框有超过一半落在自己窗口里 → 那是和大人本人，不是大肥鱼 */
+function selfIsSameBlob(slot, self) {
+  const x0 = Math.max(slot.x, self.x)
+  const y0 = Math.max(slot.y, self.y)
+  const x1 = Math.min(slot.x + slot.w, self.x + self.width)
+  const y1 = Math.min(slot.y + slot.h, self.y + self.height)
+  if (x1 <= x0 || y1 <= y0) return false
+  const overlap = (x1 - x0) * (y1 - y0)
+  return overlap > 0.5 * slot.w * slot.h
+}
+
 async function detectFish() {
   if (fishDetecting) return fishPresent
   if (!fishGateOpen) {
@@ -640,23 +652,37 @@ async function detectFish() {
     const slots = []
     let lastHits = 0
     let foundHits = 0
+    // 注意：下面循环变量也叫 win（捕获结果），会遮蔽模块级的和大人窗口。
+    // 自己的位置必须在循环前取好，否则自替换永远拿到 null。
+    const selfBounds = win && typeof win.getBounds === 'function' ? win.getBounds() : null
     for (const win of windows) {
       const img = win.image || (win.png ? require('electron').nativeImage.createFromPath(win.png) : null)
       const scan = scanImage(img, win.kind)
       if (!scan) continue
       lastHits = Math.max(lastHits, scan.hits)
-      if (!scan.rect) continue
+      const rects = scan.rects && scan.rects.length ? scan.rects : scan.rect ? [scan.rect] : []
+      if (!rects.length) continue
       const sx = Number(win.scaleX) > 0 ? Number(win.scaleX) : 1
       const sy = Number(win.scaleY) > 0 ? Number(win.scaleY) : 1
-      slots.push({
-        x: Math.round(Number(win.x) + scan.rect.x * sx),
-        y: Math.round(Number(win.y) + scan.rect.y * sy),
-        w: Math.round(scan.rect.w * sx),
-        h: Math.round(scan.rect.h * sy),
-        hits: scan.hits,
-        from: win.kind === 'page' ? 'page' : 'desktop',
-      })
-      foundHits = Math.max(foundHits, scan.hits)
+      // 一张图里可能有好几只：每个框都进 slots，撞上任意一只就算捕到。
+      // 但**和大人自己**也是蓝的（官服），整屏扫描会把他自己扫成"鱼"——
+      // 那样一甩飞，网立刻撞在自己身上秒抓。凡是跟自己窗口大面积重合的框一律丢掉。
+      for (const r of rects) {
+        const slot = {
+          x: Math.round(Number(win.x) + r.x * sx),
+          y: Math.round(Number(win.y) + r.y * sy),
+          w: Math.round(r.w * sx),
+          h: Math.round(r.h * sy),
+          hits: r.hits || scan.hits,
+          from: win.kind === 'page' ? 'page' : 'desktop',
+        }
+        if (selfBounds && selfIsSameBlob(slot, selfBounds)) {
+          log(`skip self-blob @${slot.x},${slot.y} ${slot.w}x${slot.h}`)
+          continue
+        }
+        slots.push(slot)
+        foundHits = Math.max(foundHits, r.hits || scan.hits)
+      }
     }
     fishSlots = slots
     fishPresent = slots.length > 0
@@ -729,12 +755,11 @@ function runCapture(slot, svx, svy, forced) {
   }, 3200)
 
   const target = fishTarget || {}
-  // visible 的语义是「她在**桌面**上、能下网」：
-  //   - 桌面窗口里扫到她 → 正常判定（速度越慢越容易成）
-  //   - 只有网页（DSH 窗口）里画着她、桌面上没有 → 一定失败，并骂老纪私自袒护窝藏
-  //   - 本轮从没扫到过她 = 客户端可能根本没渲染 → 按「在」处理，别让游戏直接没法玩
-  const desktopPresent = fishSlots.some((slot) => slot.from === 'desktop')
-  const visible = fishGateOpen && (desktopPresent || !fishEverSeen)
+  // visible 的语义：屏幕上此刻确实扫到了至少一只大肥鱼，才允许判定。
+  // 不再区分「桌面窗口」还是「网页」——整屏截图之后两者本来就分不开，
+  // 以前"只画在网页里 → 必定失败"的那条规则整个删掉。
+  // 本轮从没扫到过她 = 可能刚启动、抓拍失败 → 按「在」处理，别让游戏直接没法玩。
+  const visible = fishGateOpen && (fishSlots.length > 0 || !fishEverSeen)
   const speed = Math.hypot(Number(svx) || 0, Number(svy) || 0)
   let verdict
   if (forced === 'success') verdict = { result: 'success', chance: 0, reckless: false, speed }
@@ -746,7 +771,7 @@ function runCapture(slot, svx, svy, forced) {
   const now = Date.now()
   let anim = '跪舔'
   let face = '04-委屈'
-  let line = capture.pickLine(capture.APOLOGY_LINES)
+  let line = capture.pickLine(capture.FAIL_LINES)
   if (verdict.result === 'success') {
     anim = '网住大肥鱼'
     face = '05-得意'
@@ -1374,3 +1399,10 @@ if (!gotLock) {
     tray?.destroy()
   })
 }
+
+
+// 启动后预热一次捕鱼槽位：不预热的话第一次甩飞时 fishSlots 还是空的，
+// 碰撞只能用配置推算的框（她可能已经被拖走），而且探测本身要花几百毫秒。
+setTimeout(() => {
+  if (fishGateOpen && !fishDetecting) void detectFish()
+}, 5000)
