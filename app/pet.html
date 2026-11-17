@@ -463,10 +463,10 @@ function applyState(next) {
     return
   }
 
-  // 牢房待机（查国库发现欠债时触发）：期间用囚犯形象，工作/捕捉优先
+  // 牢房待机（查国库发现亏空时触发）：期间用囚犯形象，工作/捕捉优先
   const jailAt = Number(state.jail?.until) || 0
   if (jailAt > jailUntil) jailUntil = jailAt
-  // 牢房是「查国库发现欠债」的戏剧时刻：哪怕正在干活也先演这一出，演完再回去干活
+  // 牢房是「查国库发现亏空」的戏剧时刻：哪怕正在干活也先演这一出，演完再回去干活
   if (jailUntil > Date.now()) {
     if (state.work?.active) workPhase = 'idle'
     if (currentAnim !== JAIL_IDLE && currentAnim !== JAIL_IDLE_LEFT) {

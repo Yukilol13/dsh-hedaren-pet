@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>欠债阈值</title>
+<title>亏空阈值</title>
 <style>
   * { box-sizing: border-box; }
   html, body {
@@ -35,10 +35,10 @@
 </head>
 <body>
 <div class="wrap">
-  <div class="title">欠债阈值（元）</div>
+  <div class="title">亏空阈值（元）</div>
   <div class="hint">国库余额低于这个数，查国库时和大人就会被关进牢房（0.01 – 10000，两位小数）</div>
   <div class="row">
-    <input id="val" type="number" min="0.01" max="10000" step="0.01" placeholder="例如 0.50" />
+    <input id="val" type="number" min="0.01" max="10000" step="0.01" placeholder="例如 10.00" />
   </div>
   <div class="err" id="err"></div>
   <div class="btns">

@@ -12,7 +12,7 @@ contextBridge.exposeInMainWorld('heshen', {
   onThrowEnd: (cb) => ipcRenderer.on('win:throwEnd', () => cb()),
   onThrowState: (cb) => ipcRenderer.on('win:throwState', (_event, state) => cb(state)),
   prefetchFish: () => ipcRenderer.send('fish:prefetch'),
-  // 欠债阈值窗口
+  // 亏空阈值窗口
   onThresholdInit: (cb) => ipcRenderer.on('jail:threshold-init', (_event, value) => cb(value)),
   saveThreshold: (value) => ipcRenderer.send('jail:threshold-save', value),
   closeThreshold: () => ipcRenderer.send('jail:threshold-close'),

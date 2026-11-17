@@ -126,7 +126,7 @@ let category = null
 let scale = 1
 let scaleDragging = false
 let throwSettleMs = 50
-let jailThreshold = 0
+let jailThreshold = 10
 
 const SETTLE_MIN = 50
 const SETTLE_MAX = 500
@@ -136,7 +136,7 @@ async function refreshSnapshot() {
     const s = await window.heshen.readState()
     scale = Math.max(0.7, Math.min(1.5, Number(s.scale) || 1))
       throwSettleMs = Math.max(SETTLE_MIN, Math.min(SETTLE_MAX, Math.round(Number(s.throwSettleMs) || SETTLE_MIN)))
-    jailThreshold = Math.max(0, Math.min(10000, Math.round((Number(s.jailThreshold) || 0) * 100) / 100))
+    jailThreshold = Math.max(0, Math.min(10000, Math.round((Number(s.jailThreshold) || 10) * 100) / 100))
   } catch {}
 }
 
@@ -217,7 +217,7 @@ function renderMain() {
   menu.appendChild(
     el('button', {
       className: 'cat',
-      text: `欠债阈值：${jailThreshold > 0 ? jailThreshold.toFixed(2) : '未设置'} `,
+      text: `亏空阈值：${jailThreshold > 0 ? jailThreshold.toFixed(2) : '未设置'} `,
       onclick: () => act({ action: 'jail-threshold' }),
     }),
   )

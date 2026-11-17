@@ -357,18 +357,20 @@ export function apply(ctx, rawConfig = {}) {
     return writeState({ anim: { id: Date.now(), name: String(animName || IDLE), loop: loop !== false } })
   }
 
-  // ---------- 欠债阈值（牢房）----------
+  // ---------- 亏空阈值（牢房）----------
+  /** 没存过阈值时的默认值：余额低于 10 元就进牢房 */
+  const DEFAULT_JAIL_THRESHOLD = 10
   const jailThresholdFile = join(dshHome(), 'heshen-pet', 'jail-threshold.json')
 
-  /** 读「欠债阈值」：余额低于它就让和大人进牢房。0 = 不启用 */
+  /** 读「亏空阈值」：余额低于它就让和大人进牢房。没设置过就用默认 10 元 */
   async function readJailThreshold() {
     try {
       const raw = JSON.parse(await readFile(jailThresholdFile, 'utf8'))
       const v = Number(raw?.value)
-      if (!Number.isFinite(v) || v < 0.01 || v > 10000) return 0
+      if (!Number.isFinite(v) || v < 0.01 || v > 10000) return DEFAULT_JAIL_THRESHOLD
       return Math.round(v * 100) / 100
     } catch {
-      return 0
+      return DEFAULT_JAIL_THRESHOLD
     }
   }
 

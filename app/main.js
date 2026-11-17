@@ -24,14 +24,17 @@ const BUBBLE_W = 300
 const BUBBLE_H = 132
 const JAIL_THRESHOLD_FILE = () => path.join(STATE_DIR, 'jail-threshold.json')
 
-/** 读欠债阈值（元）。没有就返回 0 = 不启用 */
+/** 亏空阈值（元）的默认值：没设置过时按 10 元算 */
+const DEFAULT_JAIL_THRESHOLD = 10
+
+/** 读亏空阈值（元）。没有就返回默认值 10 */
 function readJailThreshold() {
   try {
     const raw = JSON.parse(fs.readFileSync(JAIL_THRESHOLD_FILE(), 'utf8'))
     const v = Number(raw?.value)
-    return Number.isFinite(v) && v >= 0.01 && v <= 10000 ? Math.round(v * 100) / 100 : 0
+    return Number.isFinite(v) && v >= 0.01 && v <= 10000 ? Math.round(v * 100) / 100 : DEFAULT_JAIL_THRESHOLD
   } catch {
-    return 0
+    return DEFAULT_JAIL_THRESHOLD
   }
 }
 
@@ -1014,9 +1017,9 @@ function createPetWindow() {
     // 可选初始状态：常服（#changfu）、镜像（#mirror），测试用
     const hash = []
     win.loadFile(path.join(__dirname, 'pet.html'), hash.length ? { hash: hash.join('-') } : undefined)
-  // 启动时把已保存的欠债阈值同步进 state，右键菜单才能显示当前值
+  // 启动时把已保存的亏空阈值同步进 state，右键菜单才能显示当前值
   try {
-    writeState({ jailThreshold: readJailThreshold() || null })
+    writeState({ jailThreshold: readJailThreshold() })
   } catch {}
 
   }
