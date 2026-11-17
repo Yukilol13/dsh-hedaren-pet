@@ -66,12 +66,48 @@ dsh-hedaren-pet/
 ## 环境与依赖
 
 - **DeepSeek Harness**（桌面版 Web GUI）
-- **dsh-pet**（可选）：用来定位/关闭大肥鱼；没有它时捕捉玩法会退化成"撞配置位置"
-- Windows（窗口探测、托盘、PrintWindow 都是 Windows API；其它平台未适配）
+- **dsh-pet**（可选，装了才有捕鱼玩法；见下节「捕鱼的前置条件」）
+
+### 平台支持
+
+| 平台 | 桌宠本体（窗口/动画/拖拽/菜单/聊天/国库/牢房） | 捕鱼（定位大肥鱼） |
+| --- | --- | --- |
+| **Windows** | ✅ 已验证 | ✅ PowerShell + PrintWindow（1:1 抓窗口内容） |
+| **macOS** | ✅ 逻辑上可用（Electron 通用 API） | ⚠️ 需给 Electron **屏幕录制**权限（窗口位置用 `osascript`，需要**辅助功能**权限），未在真机验证 |
+| **Linux (X11)** | ✅ 逻辑上可用 | ⚠️ 需装 `wmctrl`（或 `xdotool`）+ Electron 屏幕捕获；HiDPI 会按 `scaleFactor` 折算，未在真机验证 |
+| **Linux (Wayland)** | ⚠️ 透明窗口依赖合成器 | ❌ 窗口枚举基本不可用，捕鱼会因 `no-window-tool` 被门禁关掉 |
+
+窗口探测集中在 `app/winprobe.js`：Windows 走 PowerShell + user32，macOS 走 `osascript`，
+Linux 走 `wmctrl -lG` / `xdotool`；抓窗口内容在 Windows 用 PrintWindow、其它平台用 Electron 的
+`desktopCapturer`。任一平台探测失败只会让**捕鱼**失效，不影响桌宠本体。
+
+## 捕鱼的前置条件（门禁）
+
+捕鱼不是永远在跑。只有同时满足下面三条才会做窗口探测与像素扫描：
+
+1. **大肥鱼插件装着且启用** —— 检测宿主上的路由前缀（`/dsh-pet-*` 或 `/dsh-dafeiyu-*`）。
+   插件没装、或装了但在插件管理器里关掉 → 前缀消失 → 直接不检测。
+2. **配置里确实有这只宠物**（默认 `id=main`）。
+3. **她的 `display` 不是 `none`**（`desktop` / `both` / `web` 都算有显示）。
+
+任何一条不满足：`state.dshpet.gate = { open: false, reason }`，桌宠侧完全不探测、不给碰撞框，
+撞空气也不会触发捕捉判定。常见 `reason`：
+
+| reason | 含义 |
+| --- | --- |
+| `no-plugin` | 没装大肥鱼插件，或插件被关掉 |
+| `no-fish-pet` | 配置里没有那只宠物 |
+| `fish-hidden` | 她把显示关了（`display: none`） |
+| `ok` | 门禁打开，正常检测 |
+
+检测时机也只有两个：**按下拖动时**预扫一次、**甩飞瞬间**补扫一次（坐标超过 1.5 秒就作废重扫），
+平时完全不扫，不占 CPU。
 
 ## 已知限制
 
-- 大肥鱼的位置靠**像素扫描**判断（PowerShell `PrintWindow` + 蓝色连通块），不消耗 token，但一次约 0.3–1.5 秒；只在**按下拖动**和**甩飞瞬间**扫描
+- 大肥鱼的位置靠**像素扫描**判断（抓窗口内容 + 蓝色连通块），**不调用任何模型接口、不消耗 token**，
+  一次约 0.3–1.5 秒（Windows PowerShell 冷启动更慢）；只在**按下拖动**和**甩飞瞬间**扫描
+- macOS 的窗口位置依赖 System Events，需要用户在系统设置里授权；Linux Wayland 下窗口枚举不可用
 - 动画素材为 1x 分辨率（278×306），显示按 0.75 基准缩放，放大到 150% 会略软
 - 甩飞形象/网住动画的左右两版是镜像素材，不是重新绘制
 

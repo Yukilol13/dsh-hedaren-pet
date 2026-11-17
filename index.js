@@ -110,7 +110,19 @@ function pick(list) {
 function electronPath() {
   const explicit = process.env.DSH_PET_ELECTRON_PATH
   if (explicit && existsSync(explicit)) return explicit
-  return join(dshHome(), 'electron', 'electron.exe')
+  const base = join(dshHome(), 'electron')
+  // 三平台的 Electron 可执行文件位置不一样
+  const candidates =
+    process.platform === 'win32'
+      ? [join(base, 'electron.exe')]
+      : process.platform === 'darwin'
+        ? [
+            join(base, 'Electron.app', 'Contents', 'MacOS', 'Electron'),
+            join(base, 'electron'),
+          ]
+        : [join(base, 'electron'), join(base, 'electron', 'electron')]
+  for (const candidate of candidates) if (existsSync(candidate)) return candidate
+  return candidates[0]
 }
 
 function spawnPet(log, extraEnv = {}) {
@@ -209,6 +221,7 @@ export function apply(ctx, rawConfig = {}) {
         window: target?.window || null,
         helper: target?.helper || null,
         helpers: Array.isArray(target?.helpers) ? target.helpers : [],
+        gate: target?.gate || null,
         dshWindow: target?.dshWindow || null,
         at: Date.now(),
       },

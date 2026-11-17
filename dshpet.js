@@ -57,75 +57,16 @@ function stripJsonc(text) {
 }
 
 /** 枚举 Windows 顶层窗口，取 DSH 那个窗口的客户区（物理像素） */
-const WIN_SCRIPT = String.raw`
-$ErrorActionPreference = 'Stop'
-Add-Type -TypeDefinition @"
-using System;
-using System.Text;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-public class HeshenWin {
-  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
-  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder sb, int max);
-  [DllImport("user32.dll")] public static extern int GetWindowTextLengthW(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, out RECT r);
-  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT p);
-  [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
-  public struct RECT { public int Left, Top, Right, Bottom; }
-  public struct POINT { public int X, Y; }
-  public static string FindAll(string needle) {
-    var list = new List<string>();
-    EnumWindows((h, l) => {
-      if (!IsWindowVisible(h)) return true;
-      int len = GetWindowTextLengthW(h);
-      if (len <= 0) return true;
-      var sb = new StringBuilder(len + 1);
-      GetWindowTextW(h, sb, sb.Capacity);
-      if (sb.ToString().IndexOf(needle, StringComparison.OrdinalIgnoreCase) < 0) return true;
-      RECT r; POINT p = new POINT();
-      if (!GetClientRect(h, out r)) return true;
-      if (!ClientToScreen(h, ref p)) return true;
-      uint pid; GetWindowThreadProcessId(h, out pid);
-      double dpi = GetDpiForWindow(h) / 96.0;
-      list.Add("{\"pid\":" + pid + ",\"title\":\"" + sb.ToString().Replace("\\", "\\\\").Replace("\"", "\\\"") + "\",\"x\":" + p.X + ",\"y\":" + p.Y + ",\"w\":" + (r.Right - r.Left) + ",\"h\":" + (r.Bottom - r.Top) + ",\"dpi\":" + dpi.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "}");
-      return true;
-    }, IntPtr.Zero);
-    return "{\"ok\":true,\"windows\":[" + string.Join(",", list) + "]}";
-  }
-}
-"@
-[HeshenWin]::FindAll('__NEEDLE__')
-`
+const winprobe = nodeRequire('./app/winprobe.js')
 
-/** 把标题里含 needle 的可见窗口全部列出来（客户区，DIP）。dsh-pet 每只桌宠各有一个同标题窗口。 */
-function runWindowProbeAll(timeout = 6000, needle = 'DeepSeek Harness') {
-  const script = WIN_SCRIPT.replace('__NEEDLE__', needle.replace(/'/g, "''"))
-  return new Promise((resolve) => {
-    execFile(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-      { timeout, windowsHide: true, maxBuffer: 1 << 20 },
-      (error, stdout) => {
-        if (error) {
-          resolve({ ok: false, reason: `probe-failed: ${error.message.slice(0, 120)}`, windows: [] })
-          return
-        }
-        try {
-          const parsed = JSON.parse(String(stdout).trim())
-          if (!parsed || !Array.isArray(parsed.windows)) {
-            resolve({ ok: false, reason: 'probe-bad-shape', windows: [] })
-            return
-          }
-          resolve({ ok: parsed.windows.length > 0, windows: parsed.windows })
-        } catch {
-          resolve({ ok: false, reason: 'probe-bad-json', windows: [] })
-        }
-      },
-    )
-  })
+/**
+ * 所有标题含 needle 的可见窗口（跨平台）：
+ * Windows 走 PowerShell + user32，macOS 走 osascript，Linux 走 wmctrl / xdotool。
+ * 详见 app/winprobe.js。
+ */
+async function runWindowProbeAll(timeout = 6000, needle = 'DeepSeek Harness') {
+  const result = await winprobe.listWindows(needle, { timeout })
+  return { ok: Boolean(result.ok), tool: result.tool, reason: result.reason, windows: result.windows || [] }
 }
 
 /** 单个窗口（第一个标题命中的） */
@@ -298,13 +239,60 @@ export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
     return pets.find((p) => String(p?.id) === 'main') || pets[0]
   }
 
+  /**
+   * 找「大肥鱼」类插件挂在宿主上的路由前缀：只有插件装着并启用时才有这个前缀。
+   * dsh-pet 用 `/dsh-pet-7340`；同类插件（如 dsh-dafeiyu-pet）用 `/dsh-dafeiyu*`。
+   */
+  function petPlugins() {
+    const found = []
+    try {
+      const ws = ctx?.get?.('webServer', false)
+      const prefixes = ws?.prefixes
+      const keys = prefixes instanceof Map ? [...prefixes.keys()] : Object.keys(prefixes || {})
+      for (const key of keys) {
+        const k = String(key)
+        if (/\/dsh-pet/i.test(k)) found.push({ kind: 'dsh-pet', path: k })
+        else if (/\/dsh-dafeiyu/i.test(k)) found.push({ kind: 'dsh-dafeiyu', path: k })
+      }
+    } catch {}
+    return found
+  }
+
+  let gateCache = { at: 0, value: null }
+
+  /**
+   * 捕鱼门禁：**没有大肥鱼插件、插件没启用、或她把显示关了** 时返回 open=false，
+   * 上层据此完全不做窗口探测与像素扫描。
+   */
+  async function gate({ force = false } = {}) {
+    if (!force && gateCache.value && Date.now() - gateCache.at < 1500) return gateCache.value
+    const plugins = petPlugins()
+    const at = Date.now()
+    const done = (value) => {
+      gateCache = { at: Date.now(), value }
+      return value
+    }
+    if (!plugins.length) {
+      return done({ open: false, reason: 'no-plugin', plugin: '', petId: '', display: '', at })
+    }
+    const { config, source } = await readConfig({ force })
+    const pet = pickPet(config)
+    if (!pet) {
+      return done({ open: false, reason: 'no-fish-pet', plugin: plugins[0].kind, petId: '', display: '', source, at })
+    }
+    const display = String(pet.display || 'web')
+    const base = { plugin: plugins[0].kind, petId: String(pet.id), display, source, at }
+    if (display === 'none') return done({ open: false, reason: 'fish-hidden', ...base })
+    return done({ open: true, reason: 'ok', ...base })
+  }
+
   const WINDOW_CACHE = new Map()
 
   /** 按标题找窗口，返回它的客户区（DIP）。helper = dsh-pet 的桌面宠物窗口 */
   async function windowRect({ force = false, needle = 'DeepSeek Harness' } = {}) {
     const cached = WINDOW_CACHE.get(needle)
     if (!force && cached && Date.now() - cached.at < 1500) return cached.value
-    const value = await runWindowProbe(6000, needle)
+    const value = await runWindowProbe(12000, needle)
     WINDOW_CACHE.set(needle, { at: Date.now(), value })
     return value
   }
@@ -315,7 +303,7 @@ export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
   async function helperWindows({ force = false } = {}) {
     const cached = WINDOW_CACHE.get('dsh-pet 桌宠')
     if (!force && cached && Date.now() - cached.at < 1500) return cached.value
-    const value = await runWindowProbeAll(6000, 'dsh-pet 桌宠')
+    const value = await runWindowProbeAll(12000, 'dsh-pet 桌宠')
     if (Array.isArray(value.windows) && value.windows.length > 0) {
       lastNonEmptyHelpers = value
     } else if (lastNonEmptyHelpers) {
@@ -339,16 +327,31 @@ export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
    * DSH 窗口客户区、DPI 一起算进来。display 不含 web 时仍返回框（位置还在），visible=false。
    */
   async function target({ force = false } = {}) {
-    const [{ config, source }, dsh, helperList] = await Promise.all([
-      readConfig({ force }),
-      windowRect({ force, needle: 'DeepSeek Harness' }),
-      helperWindows({ force }),
-    ])
+    // 门禁先查：没有大肥鱼插件 / 插件没开 / 她把显示关了 → 不探测窗口，直接判「不生效」
+    const gateInfo = await gate({ force })
+    if (!gateInfo.open) {
+      return {
+        ok: false,
+        reason: gateInfo.reason,
+        gate: gateInfo,
+        visible: false,
+        surface: '',
+        helpers: [],
+        at: Date.now(),
+      }
+    }
+    // 串行探测：两个 PowerShell 同时启动时慢的那个会被超时掐掉，导致「明明有窗口却判 no-window」
+    const { config, source } = await readConfig({ force })
+    const helperList = await helperWindows({ force })
+    const dsh = await windowRect({ force, needle: 'DeepSeek Harness' })
     const helpers = helperList.windows || []
-    const helper = helpers[0] || { ok: false, reason: helperList.reason || 'window-not-found' }
+    // winprobe 返回的是裸窗口（无 ok 字段），这里补齐，后面对 helper.ok 的判定才有意义
+    const helper = helpers[0]
+      ? { ...helpers[0], ok: true }
+      : { ok: false, reason: helperList.reason || 'window-not-found' }
     const pet = pickPet(config)
     if (!pet) {
-      return { ok: false, reason: 'no-pet', source, visible: false }
+      return { ok: false, reason: 'no-pet', source, visible: false, gate: gateInfo }
     }
     const display = String(pet.display || 'web')
     const wantsDesktop = display === 'desktop' || display === 'both'
@@ -368,6 +371,7 @@ export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
         source,
         visible: false,
         surface,
+        gate: gateInfo,
         helper: helper.ok ? { x: helper.x, y: helper.y, w: helper.w, h: helper.h, title: helper.title || '' } : null,
       }
     }
@@ -398,6 +402,7 @@ export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
       surface,
       visible: display !== 'none' && inWindow,
       inWindow,
+      gate: gateInfo,
       source,
       at: Date.now(),
     }
@@ -528,7 +533,7 @@ export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
     }
   }
 
-  return { origin, api, readConfig, pickPet, windowRect, helperWindow, helperWindows, target, hide, show, petState, probeAuth }
+  return { origin, api, readConfig, pickPet, windowRect, helperWindow, helperWindows, target, gate, petPlugins, hide, show, petState, probeAuth }
 }
 
 export { runWindowProbe }

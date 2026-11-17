@@ -13,6 +13,7 @@ const path = require('node:path')
 const os = require('node:os')
 
 const capture = require('./capture')
+const winprobe = require('./winprobe')
 
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 const STATE_DIR = path.join(DSH_HOME, 'heshen-pet')
@@ -97,6 +98,8 @@ let fishEverSeen = false // 这一次运行里见过大肥鱼没有：从没见�
 const FISH_FRESH_MS = 8000 // 像素扫描的新鲜期：比轮询间隔（5 秒）宽一点
 let fishWindowCount = 0 // 上一次扫描看到的窗口数：0 = 探测本身失败，不能据此断言她不在
 let fishSlots = [] // 这一轮扫到的所有碰撞框（桌面窗口里的她 + 网页/DSH 窗口里的她）
+let fishGateOpen = false // 捕鱼门禁：插件装着+启用+她显示着，才做探测
+let fishGateReason = 'unknown' // 门禁原因（no-plugin / fish-hidden / ok…）
 let flightFacing = '' // 最近一次飞行朝向：'left' | 'right' | ''
 let menuOpenAt = 0
 let menuOutsideTicks = 0
@@ -329,6 +332,12 @@ function startStateWatcher() {
       return
     }
     fishTarget = state.dshpet || null
+    const gate = state.dshpet?.gate
+    if (gate && typeof gate.open === 'boolean') {
+      if (fishGateOpen !== gate.open) log(`fish gate -> ${gate.open ? 'open' : 'closed'} (${gate.reason || ''})`)
+      fishGateOpen = gate.open
+      fishGateReason = String(gate.reason || '')
+    }
     const helpersNow = Array.isArray(state.dshpet?.helpers) ? state.dshpet.helpers.filter((h) => Number.isFinite(Number(h?.x))) : []
     if (helpersNow.length) {
       fishHelpers = helpersNow
@@ -395,6 +404,8 @@ function configSlotRect() {
  * 大肥鱼会走、会被拖，扫出来的才是真的。
  */
 function fishSlotRect() {
+  // 门禁关（没插件/没启用/她没显示）→ 一个框都不给，撞空气也不会有判定
+  if (!fishGateOpen) return null
   const fresh = fishDetectAt > 0 && Date.now() - fishDetectAt < FISH_FRESH_MS
   // 刚扫过、而且没扫到她：她确实不在画面上（被网走了/被关了/没显示）
   // 这时不能退回「配置推算的框」——那个框永远在，会让她明明不在也被撞出捕捉判定
@@ -407,45 +418,97 @@ function fishSlotRect() {
 }
 
 /**
- * 让 PowerShell 把每个 dsh-pet 桌宠窗口各自 PrintWindow 成 PNG，并给出窗口客户区位置（DIP）。
- * 为什么要这么绕：桌宠窗口是**透明置顶**的，直接截屏会把背后的视频/牌桌一起拍进来，
- * 蓝色像素满地都是；PrintWindow 取的是窗口自己画的内容，只有宠物本体。
+ * 抓每个桌宠窗口「窗口自己画的内容」+ 客户区位置（DIP）。
+ *
+ * - **Windows**：PowerShell PrintWindow 存 PNG（透明窗直接截屏会把背后内容拍进来，PrintWindow 只取窗口自己）
+ * - **macOS / Linux**：Electron `desktopCapturer` 抓单个窗口的缩略图（macOS 需要「屏幕录制」权限），
+ *   位置由 `winprobe` 给；两边的尺寸不一定 1:1，所以顺带返回 scaleX/scaleY 用来换算像素框
+ *
+ * 结果每项：{ kind, title, x, y, w, h, png?|image?, scaleX?, scaleY? }
  */
-function probePetWindows(timeout = 8000) {
-  const script = path.join(__dirname, 'print_pets.ps1')
-  if (!fs.existsSync(script)) return Promise.resolve([])
-  return new Promise((resolve) => {
-    execFile(
-      'powershell.exe',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script],
-      { timeout, windowsHide: true, maxBuffer: 1 << 20 },
-      (error, stdout) => {
-        if (error) {
-          log(`pet window probe failed ${error?.message || error}`)
-          resolve([])
-          return
-        }
-        try {
-          const parsed = JSON.parse(String(stdout).trim() || '[]')
-          const list = Array.isArray(parsed) ? parsed : [parsed]
-          resolve(list.filter((w) => w && Number.isFinite(Number(w.x)) && w.png))
-        } catch {
-          resolve([])
-        }
-      },
-    )
-  })
+async function probePetWindows(timeout = 8000) {
+  if (process.platform === 'win32') {
+    const script = path.join(__dirname, 'print_pets.ps1')
+    if (!fs.existsSync(script)) return []
+    return new Promise((resolve) => {
+      execFile(
+        'powershell.exe',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script],
+        { timeout, windowsHide: true, maxBuffer: 1 << 20 },
+        (error, stdout) => {
+          if (error) {
+            log(`pet window probe failed ${error?.message || error}`)
+            resolve([])
+            return
+          }
+          try {
+            const parsed = JSON.parse(String(stdout).trim() || '[]')
+            const list = Array.isArray(parsed) ? parsed : [parsed]
+            resolve(list.filter((w) => w && Number.isFinite(Number(w.x)) && w.png))
+          } catch {
+            resolve([])
+          }
+        },
+      )
+    })
+  }
+
+  // macOS / Linux：位置用 winprobe，内容用 desktopCapturer
+  try {
+    const { desktopCapturer } = require('electron')
+    const scale = (screen.getPrimaryDisplay().scaleFactor || 1)
+    const list = []
+    for (const item of [
+      { needle: 'dsh-pet 桌宠', kind: 'pet' },
+      { needle: 'DeepSeek Harness', kind: 'page' },
+    ]) {
+      const probe = await winprobe.listWindows(item.needle, { timeout, scale })
+      if (!probe.windows.length) continue
+      const maxW = Math.min(1920, Math.max(...probe.windows.map((w) => w.w)))
+      const maxH = Math.min(1080, Math.max(...probe.windows.map((w) => w.h)))
+      const sources = await desktopCapturer.getSources({
+        types: ['window'],
+        thumbnailSize: { width: maxW, height: maxH },
+        fetchWindowIcons: false,
+      })
+      const matches = sources.filter((src) => src.name && src.name.includes(item.needle) && !src.thumbnail.isEmpty())
+      if (!matches.length) {
+        log(`window capture unavailable（${item.needle}）：拍不到窗口内容（macOS 请在系统设置里给 Electron「屏幕录制」权限）`)
+        continue
+      }
+      const n = Math.min(matches.length, probe.windows.length)
+      for (let i = 0; i < n; i++) {
+        const win = probe.windows[i]
+        const thumb = matches[i].thumbnail
+        const ts = thumb.getSize()
+        if (!ts.width || !ts.height || !win.w || !win.h) continue
+        list.push({
+          kind: item.kind,
+          title: win.title,
+          x: win.x,
+          y: win.y,
+          w: win.w,
+          h: win.h,
+          image: thumb,
+          scaleX: win.w / ts.width,
+          scaleY: win.h / ts.height,
+        })
+      }
+    }
+    return list
+  } catch (error) {
+    log(`pet window probe failed ${error?.message || error}`)
+    return []
+  }
 }
 
 /**
  * 在一张 PrintWindow 出来的 PNG 里找大肥鱼（蓝毛连通块）。
  * @returns {{hits:number, rect:object|null}|null} rect 是相对窗口客户区的 DIP 偏移
  */
-function scanPng(pngPath, kind = 'pet') {
+function scanImage(img, kind = 'pet') {
   try {
-    const { nativeImage } = require('electron')
-    const img = nativeImage.createFromPath(pngPath)
-    if (img.isEmpty()) return null
+    if (!img || typeof img.getSize !== 'function' || img.isEmpty()) return null
     const { width: w, height: h } = img.getSize()
     if (!w || !h) return null
     const bmp = img.toBitmap() // BGRA
@@ -539,11 +602,34 @@ function scanPng(pngPath, kind = 'pet') {
 }
 
 /**
- * 找大肥鱼：逐个桌宠窗口 PrintWindow，再在每张图里找「蓝毛连通块」。
+ * 从文件路径抓一张图再扫（Windows PrintWindow 的产物）
+ * @returns {{hits:number, rect:object|null}|null}
+ */
+function scanPng(pngPath, kind = 'pet') {
+  try {
+    const { nativeImage } = require('electron')
+    return scanImage(nativeImage.createFromPath(pngPath), kind)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 找大肥鱼：逐个桌宠窗口取内容，再在每张图里找「蓝毛连通块」。
  * 找到就把「窗口位置 + 块包围盒」换算成屏幕 DIP 当碰撞框；一个都没找到 = 她不在画面上（撞击必失手）。
  */
 async function detectFish() {
   if (fishDetecting) return fishPresent
+  if (!fishGateOpen) {
+    // 没有大肥鱼插件 / 插件没启用 / 她把显示关了：完全不检测（省 CPU，也不会有幽灵判定）
+    fishSlots = []
+    fishPresent = false
+    fishEverSeen = false
+    fishDetectRect = null
+    fishDetectAt = 0
+    fishWindowCount = 0
+    return false
+  }
   fishDetecting = true
   try {
     const windows = await probePetWindows()
@@ -552,15 +638,18 @@ async function detectFish() {
     let lastHits = 0
     let foundHits = 0
     for (const win of windows) {
-      const scan = scanPng(win.png, win.kind)
+      const img = win.image || (win.png ? require('electron').nativeImage.createFromPath(win.png) : null)
+      const scan = scanImage(img, win.kind)
       if (!scan) continue
       lastHits = Math.max(lastHits, scan.hits)
       if (!scan.rect) continue
+      const sx = Number(win.scaleX) > 0 ? Number(win.scaleX) : 1
+      const sy = Number(win.scaleY) > 0 ? Number(win.scaleY) : 1
       slots.push({
-        x: Math.round(Number(win.x) + scan.rect.x),
-        y: Math.round(Number(win.y) + scan.rect.y),
-        w: Math.round(scan.rect.w),
-        h: Math.round(scan.rect.h),
+        x: Math.round(Number(win.x) + scan.rect.x * sx),
+        y: Math.round(Number(win.y) + scan.rect.y * sy),
+        w: Math.round(scan.rect.w * sx),
+        h: Math.round(scan.rect.h * sy),
         hits: scan.hits,
         from: win.kind === 'page' ? 'page' : 'desktop',
       })
@@ -591,6 +680,7 @@ async function detectFish() {
           slots: slots.map((x) => ({ from: x.from, x: x.x, y: x.y, w: x.w, h: x.h })),
           rect: fishDetectRect,
           surface: fishTarget?.surface || '',
+          gate: fishGateOpen,
           at: Date.now(),
         },
       })
@@ -641,7 +731,7 @@ function runCapture(slot, svx, svy, forced) {
   //   - 只有网页（DSH 窗口）里画着她、桌面上没有 → 一定失败，并骂老纪私自袒护窝藏
   //   - 本轮从没扫到过她 = 客户端可能根本没渲染 → 按「在」处理，别让游戏直接没法玩
   const desktopPresent = fishSlots.some((slot) => slot.from === 'desktop')
-  const visible = desktopPresent || !fishEverSeen
+  const visible = fishGateOpen && (desktopPresent || !fishEverSeen)
   const speed = Math.hypot(Number(svx) || 0, Number(svy) || 0)
   let verdict
   if (forced === 'success') verdict = { result: 'success', chance: 0, reckless: false, speed }
@@ -706,7 +796,7 @@ function throwWindow(vx, vy) {
   stopThrow(false) // 起飞前清场：不要把甩飞形象收掉
   if (!win) return
   // 起飞瞬间：坐标不是刚量的就立刻补一次（拖动时已经预扫过，通常这里就是新的）
-  if (!fishDetecting && Date.now() - fishDetectAt > 600) void detectFish()
+  if (fishGateOpen && !fishDetecting && Date.now() - fishDetectAt > 600) void detectFish()
   log(
     `throw start speed=${Math.round(Math.hypot(Number(vx) || 0, Number(vy) || 0))} ` +
       `fishAge=${fishDetectAt ? Date.now() - fishDetectAt : -1}ms ` +
@@ -1127,6 +1217,7 @@ ipcMain.on('app:quit', () => app.quit())
 
 ipcMain.on('fish:prefetch', () => {
   // 拖拽开始就重扫一次：松手甩出去的那一刻，用的是「刚量过」的坐标
+  if (!fishGateOpen) return
   if (!fishDetecting && Date.now() - fishDetectAt > 600) void detectFish()
 })
 
