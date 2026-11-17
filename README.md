@@ -72,18 +72,23 @@ dsh-hedaren-pet/
 
 | 平台 | 桌宠本体（窗口/动画/拖拽/菜单/聊天/国库/牢房） | 捕鱼（定位大肥鱼） |
 | --- | --- | --- |
-| **Windows** | ✅ 已验证 | ✅ 整屏截图 + 蓝色连通块 |
+| **Windows** | ✅ 已验证 | ✅ PrintWindow 按窗口抓图 + 蓝色连通块（子进程，不占主线程） |
 | **macOS** | ✅ 已在真机验证（Retina / scaleFactor 2） | ✅ 整屏截图；需给 Electron **屏幕录制**权限 |
 | **Linux (X11)** | ✅ 逻辑上可用 | ✅ 整屏截图；需 Electron 屏幕捕获权限 |
 | **Linux (Wayland)** | ⚠️ 透明窗口依赖合成器 | ⚠️ 取决于合成器是否允许整屏捕获 |
 
-捕鱼**不再按窗口标题找宠物窗口**。dsh-pet 的桌面 helper 是 `app.dock.hide()` 的透明窗口：
-macOS 的 System Events 只枚举 `background only = false` 的进程，ScreenCaptureKit 的窗口列表里
-也常常没有它；Windows 的 PrintWindow 同样得先按标题找到窗口。三条路都要求「先找到窗口」，
-而 helper 恰恰是最难被找到的那种窗口。
+抓法按平台分两条，选型理由是**主线程开销**：
 
-现在三平台统一为 **整屏截图 + 蓝色连通块扫描**（`app/main.js` 的 `captureScreens`），
-不依赖任何窗口枚举，只要求系统允许截屏。`app/winprobe.js` 仅剩宿主侧用来估算兜底框。
+- **Windows**：`app/print_pets.ps1` 枚举标题含「dsh-pet 桌宠」「DeepSeek Harness」的窗口，
+  用 `PrintWindow(PW_RENDERFULLCONTENT)` 逐窗口抓 1:1 客户区（`probePetsPrintWindow`）。
+  抓图跑在 PowerShell 子进程里，主线程只解码一张窗口大小的 PNG 再扫（实测 10~25 ms）。
+  实测整屏 `desktopCapturer` 一次要 ~500 ms 且**全程阻塞 Electron 主线程**，
+  投掷飞行中触发重扫就是肉眼可见的卡顿，所以 Windows 不走那条路。
+- **macOS / Linux**：整屏截图（`captureScreens`，每个显示器一张）。这两边的桌面 helper 是
+  `app.dock.hide()` 的透明窗口：System Events 只枚举 `background only = false` 的进程，
+  ScreenCaptureKit 的窗口列表里也常常没有它，按标题找永远找不到，只能整屏扫。
+
+`app/winprobe.js` 仅剩宿主侧用来估算兜底框。
 
 ## 捕鱼的前置条件（门禁）
 
@@ -109,13 +114,14 @@ macOS 的 System Events 只枚举 `background only = false` 的进程，ScreenCa
 
 ## 已知限制
 
-- 大肥鱼的位置靠**整屏像素扫描**判断（蓝色连通块），**不调用任何模型接口、不消耗 token**，
-  一次约 0.2–1 秒；只在**启动预热**、**按下拖动**、**甩飞瞬间**扫描
+- 大肥鱼的位置靠**像素扫描**判断（蓝色连通块），**不调用任何模型接口、不消耗 token**；
+  只在**启动预热**、**按下拖动**、**甩飞瞬间**扫描
 - 画面里有几只大肥鱼就登记几只，撞上任意一只都算捕到；`display: both` 时网页和桌面各有一份，
   两份都能撞
-- 和大人自己的官服也是蓝的，会被整屏扫描当成鱼——所以凡是**与自己窗口重合超过一半**的连通块
-  一律丢弃，避免一甩飞就"抓到自己"
-- 目标被其它窗口**完全遮住**时扫不到（按屏幕合成结果判断，遮住就算看不见）
+- 和大人自己的官服也是蓝的，扫桌面那份时会把自己扫成鱼——所以凡是**与自己窗口重合超过一半**的
+  连通块一律丢弃，避免一甩飞就"抓到自己"
+- Windows 只抓那两个窗口的内容，目标被其它窗口**遮住**也照样扫得到；
+  macOS/Linux 按屏幕合成结果判断，遮住就算看不见
 - macOS 需要给 Electron「屏幕录制」权限；Linux Wayland 能否捕获取决于合成器
 - 动画素材为 1x 分辨率（278×306），显示按 0.75 基准缩放，放大到 150% 会略软
 - 甩飞形象/网住动画的左右两版是镜像素材，不是重新绘制

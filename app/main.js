@@ -491,20 +491,53 @@ async function captureScreens() {
 }
 
 /**
- * 取当前屏幕上的画面（每屏一张），供 detectFish 扫蓝毛。
+ * Windows：用 PowerShell + PrintWindow 只拍 dsh-pet 的桌宠窗口（按标题精确匹配）。
  *
- * 历史：这里原本按窗口标题找 dsh-pet 的桌宠窗口，Windows 走 PrintWindow、
- * macOS/Linux 走 System Events + desktopCapturer 的 window 源。两条路都要求
- * 「先按标题找到窗口」，而 dsh-pet 的桌面 helper 恰恰是最难被找到的窗口
- * （dock-hidden、透明、无边框）。现在统一成整屏截图，见 captureScreens。
+ * 为什么 Windows 必须这么走：整屏截图（desktopCapturer 的 screen 源）实测一次要
+ * ~500ms，而且**全程阻塞 Electron 主线程**（16ms 心跳只跑了 2 拍），投掷飞行中触发
+ * 重扫就是肉眼可见的卡顿。PrintWindow 跑在独立子进程里，主线程只负责解一张
+ * 窗口大小的 PNG 再扫（实测量级 1~3ms）。
+ *
+ * 产物：每窗口一张 1:1 客户区 PNG，x/y 由 ClientToScreen 给出（PowerShell 进程非
+ * DPI-aware，返回的就是 DIP，和 Electron 的 bounds 同一坐标系），所以 scale=1。
+ */
+async function probePetsPrintWindow(timeout = 8000) {
+  const script = path.join(__dirname, 'print_pets.ps1')
+  if (!fs.existsSync(script)) return []
+  return new Promise((resolve) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script],
+      { timeout, windowsHide: true, maxBuffer: 1 << 20 },
+      (error, stdout) => {
+        if (error) {
+          log(`pet window probe failed ${error?.message || error}`)
+          resolve([])
+          return
+        }
+        try {
+          const parsed = JSON.parse(String(stdout).trim() || '[]')
+          const list = Array.isArray(parsed) ? parsed : [parsed]
+          resolve(list.filter((w) => w && Number.isFinite(Number(w.x)) && w.png))
+        } catch {
+          resolve([])
+        }
+      },
+    )
+  })
+}
+
+/**
+ * 取当前屏幕上的画面，供 detectFish 扫蓝毛。
+ *
+ * - **Windows**：PrintWindow 逐窗口抓图（子进程，不占主线程；也只扫桌宠/DSH 窗口，
+ *   不会把网页 UI 里的蓝字当成大肥鱼）。
+ * - **macOS / Linux**：整屏截图（captureScreens）。这两边的桌面 helper 是
+ *   `app.dock.hide()` 的透明窗口，System Events 只枚举 background only=false 的进程、
+ *   ScreenCaptureKit 的窗口列表里也常常没有它，按标题找窗口永远找不到鱼。
  */
 async function probePetWindows(timeout = 8000) {
-  // 全平台统一：整屏截图。「按窗口标题找她」那条路整个退役。
-  // 它在任何一个平台上都不稳：dsh-pet 的桌面 helper 是 dock-hidden 的透明窗口，
-  // macOS 的 System Events 只枚举 background only=false 的进程，ScreenCaptureKit 的
-  // 窗口列表里也常常没有它；Windows 的 PrintWindow 同样得先按标题找到窗口。
-  // 任何一环断了，鱼就"凭空消失"。整屏截图不依赖窗口枚举：鱼画在哪个表面、
-  // 画了几只，扫像素一视同仁。
+  if (process.platform === 'win32') return probePetsPrintWindow(timeout)
   return captureScreens(timeout)
 }
 
