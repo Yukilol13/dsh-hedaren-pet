@@ -179,28 +179,71 @@ function hitsOf(text, list) {
   return { n, found }
 }
 
+const NUM_PAT = '[一二两三四五六七八九十\\d]{1,3}'
+const RANK_PAT = '[品级]'
+/** 动词和数字之间允许夹的字（你 / 你的 / 和大人的 / 到 / 做…），但不许跨过标点、数字和「品级」 */
+const filler = (max) => `[^一二两三四五六七八九十\\d品级，。！？；：、,.!?;:]{0,${max}}`
+
+// 「降为五品」「降到七品」= 降到几品（绝对），「降三品」= 再降三格（相对）。两回事，分开判。
+const ABS_DOWN_VERBS = [
+  '降为', '贬为', '降作', '贬作', '降到', '贬到', '降做', '降级为', '贬级为',
+  '降职为', '贬职为', '左迁为', '左迁到', '削为', '改降为',
+]
+const ABS_UP_VERBS = [
+  '升为', '晋为', '封为', '升到', '晋到', '加封为', '擢为', '任为', '授为', '补为', '提为', '进为', '升任',
+]
+const REL_DOWN_VERBS = ['降职', '连降', '左迁', '贬职', '革去', '削职', '摘去', '拿掉', '贬', '降']
+const REL_UP_VERBS = ['升职', '连升', '晋升', '加封', '加官', '升', '晋', '擢', '提']
+/** 一句话就把官撸到底的词（不带数字也算数） */
+const STRIP_VERBS = ['革职', '罢官', '撤职', '夺职', '夺官', '开缺', '抄家', '削爵', '褫职', '褫夺']
+/** 只降一格的说法 */
+const DEMOTE_ONE_VERBS = ['降职', '贬职', '降官', '摘顶戴', '摘了顶戴', '摘了你的顶戴']
+/** 「革了你的职」「褫夺他的官职」：不带数字也撸到底 */
+const STRIP_RE = /(革|褫|夺|撤|削)[^，。！？；：,.!?;:]{0,8}?职/
+/** 「降你的职」「把和大人的职位摘下」这类不带数字的：算降一格 */
+const DEMOTE_ONE_RE = /(降|贬)[^，。！？；：,.!?;:]{0,8}?的?职/
+const PROMOTE_ONE_RE = /(升|晋|提|擢)[^，。！？；：,.!?;:]{0,8}?的?职/
+/** 动词在后的：「把和大人的职降下来」「他的官位太高，往下压」 */
+const POST_DEMOTE_RE = /(的职位?|官位|品级)[^，。！？；：,.!?;:]{0,8}?(降|贬|压)/
+const POST_PROMOTE_RE = /(的职位?|官位|品级)[^，。！？；：,.!?;:]{0,8}?(升|晋|提)/
+
+function matchRank(text, verbs, { dir, absolute, max = 3 } = {}) {
+  const fill = filler(max)
+  for (const verb of verbs) {
+    const m = text.match(new RegExp(`${verb}${fill}(${NUM_PAT})\\s*${RANK_PAT}`))
+    if (!m) continue
+    const n = toNumber(m[1])
+    if (!n || n <= 0) continue
+    return { dir, n, absolute: Boolean(absolute), raw: m[0] }
+  }
+  return null
+}
+
 /**
- * 解析「降职三品」「升一品」「连降两级」这类官位指令。
- * 返回 { dir: 'down'|'up', n } —— down = 降职（品数变大），up = 升职（品数变小）
+ * 解析官位指令。两种语义分开：
+ *   「降为五品」「贬到九品」→ { dir:'down', n:5, absolute:true }（降到第几品）
+ *   「降职三品」「连降两级」→ { dir:'down', n:3, absolute:false }（再降三格）
+ * 不带数字的「革职／罢官」→ 撸到底（九品）；「降职」单说 → 降一格。
+ * @returns {{dir:'down'|'up', n:number, absolute:boolean, raw:string}|null}
  */
 export function parseRankCommand(text) {
   const t = String(text || '')
-  const rankWord = '(品|级)'
-  const patterns = [
-    { dir: 'down', re: new RegExp(`(降职|降|贬|连降|左迁)\\s*([一二两三四五六七八九十\\d]{1,3})\\s*${rankWord}`) },
-    { dir: 'down', re: new RegExp(`(降为|贬为|降作)\\s*([一二两三四五六七八九十\\d]{1,3})\\s*${rankWord}`) },
-    { dir: 'up', re: new RegExp(`(升职|升|晋升|晋|连升|加封|擢|加官|进|提)\\s*([一二两三四五六七八九十\\d]{1,3})\\s*${rankWord}`) },
-    { dir: 'up', re: new RegExp(`(升为|晋为|封为|进宫加|任为)\\s*([一二两三四五六七八九十\\d]{1,3})\\s*${rankWord}`) },
-  ]
-  for (const { dir, re } of patterns) {
-    const m = t.match(re)
-    if (!m) continue
-    const n = toNumber(m[2])
-    if (!n || n <= 0) continue
-    // 「降三级」「升两级」里的「两」已经换算过
-    return { dir, n, raw: m[0] }
-  }
-  return null
+  return (
+    matchRank(t, ABS_DOWN_VERBS, { dir: 'down', absolute: true, max: 6 }) ||
+    matchRank(t, ABS_UP_VERBS, { dir: 'up', absolute: true, max: 6 }) ||
+    matchRank(t, REL_DOWN_VERBS, { dir: 'down', absolute: false, max: 3 }) ||
+    matchRank(t, REL_UP_VERBS, { dir: 'up', absolute: false, max: 3 }) ||
+    (STRIP_VERBS.some((v) => t.includes(v)) || STRIP_RE.test(t)
+      ? { dir: 'down', n: RANK_MAX, absolute: true, raw: STRIP_VERBS.find((v) => t.includes(v)) || t.match(STRIP_RE)[0] }
+      : null) ||
+    (DEMOTE_ONE_VERBS.some((v) => t.includes(v))
+      ? { dir: 'down', n: 1, absolute: false, raw: DEMOTE_ONE_VERBS.find((v) => t.includes(v)) }
+      : null) ||
+    (DEMOTE_ONE_RE.test(t) ? { dir: 'down', n: 1, absolute: false, raw: t.match(DEMOTE_ONE_RE)[0] } : null) ||
+    (POST_DEMOTE_RE.test(t) ? { dir: 'down', n: 1, absolute: false, raw: t.match(POST_DEMOTE_RE)[0] } : null) ||
+    (PROMOTE_ONE_RE.test(t) ? { dir: 'up', n: 1, absolute: false, raw: t.match(PROMOTE_ONE_RE)[0] } : null) ||
+    (POST_PROMOTE_RE.test(t) ? { dir: 'up', n: 1, absolute: false, raw: t.match(POST_PROMOTE_RE)[0] } : null)
+  )
 }
 
 /** 语气档位（非特殊状态时） */
@@ -284,10 +327,18 @@ export function applyTurn(input, cls, now = Date.now()) {
   let released = ''
   let rankNote = ''
 
-  // 1) 官位指令
+  // 1) 官位指令：absolute=「降到几品」，否则=「再降几格」
   if (cls.rank) {
-    const { dir, n } = cls.rank
-    if (dir === 'down') {
+    const { dir, n, absolute } = cls.rank
+    if (absolute) {
+      const target = Math.min(RANK_MAX, Math.max(RANK_MIN, Math.round(n)))
+      if (target === state.rank) {
+        rankNote = dir === 'down' ? (state.rank >= RANK_MAX ? 'floor' : 'same') : state.rank <= RANK_MIN ? 'cap' : 'same'
+      } else {
+        rankNote = dir === 'down' ? 'down' : target === RANK_MIN ? 'top' : 'up'
+        state.rank = target
+      }
+    } else if (dir === 'down') {
       const next = Math.min(RANK_MAX, state.rank + n)
       rankNote = next === state.rank ? 'floor' : 'down'
       state.rank = next
@@ -402,14 +453,18 @@ export function directiveFor(mood, cls, before = null) {
   }
 
   if (cls?.rank) {
-    const { dir, n } = cls.rank
+    const { dir, n, absolute } = cls.rank
     const now = rankLabel(state.rank)
-    if (dir === 'down') {
-      lines.push(
-        `皇上刚把你降了 ${n} 品，你现在是${now}。回话里只许说自己是${now}，别自己编别的品级；谢恩领旨即可。`,
-      )
-    } else if (state.rankNote === 'cap') {
+    if (state.rankNote === 'cap') {
       lines.push('皇上要给你升官，但你已是一品，升无可升：先谢恩，再说明无法再升、按律每加一品只加三成俸禄。')
+    } else if (state.rankNote === 'floor') {
+      lines.push('皇上又要把你往下撸，可你已经是九品、再无品可降了：磕头谢恩，自嘲一句再降就只能去种地。')
+    } else if (state.rankNote === 'same') {
+      lines.push(`皇上这话提到官位，可你现在就是${now}：别自己改口，谢恩或请罪皆可。`)
+    } else if (dir === 'down') {
+      lines.push(
+        `皇上刚把你${absolute ? `降成了${now}` : `降了 ${n} 品`}，你现在是${now}。回话里只许说自己是${now}，别自己编别的品级；谢恩领旨即可。`,
+      )
     } else {
       lines.push(`皇上刚给你升了 ${n} 品，你现在是${now}。回话里只许说自己是${now}，别自己编别的品级；谢恩即可。`)
     }

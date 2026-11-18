@@ -65,15 +65,42 @@ window.__ModuleLoader__.load({
       const [data, setData] = React.useState(null)
       const [error, setError] = React.useState('')
       const [saved, setSaved] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [refreshedAt, setRefreshedAt] = React.useState(0)
 
       const [diary, setDiary] = React.useState(null)
       const [picked, setPicked] = React.useState([])
       const [burnNote, setBurnNote] = React.useState('')
       const [expanded, setExpanded] = React.useState([])
 
+      // 自动刷新：stamp 没变就不重画；皇上正拖着滑块时先按住不动
+      const stampRef = React.useRef('')
+      const diaryStampRef = React.useRef('')
+      const modelRef = React.useRef('')
+      const holdRef = React.useRef(0)
+      const hold = (ms = 2500) => {
+        holdRef.current = Date.now() + ms
+      }
+
       const apply = React.useCallback((payload) => {
         if (payload && payload.ok && payload.settings) setData(payload.settings)
         else setError((payload && payload.message) || '设置读不出来')
+      }, [])
+
+      const mergeLive = React.useCallback((live) => {
+        if (!live) return
+        setData((prev) => {
+          if (!prev) return prev
+          return {
+            ...prev,
+            ...live,
+            balance: { ...(prev.balance || {}), ...(live.balance || {}) },
+            treasury: { ...(prev.treasury || {}), ...(live.treasury || {}) },
+            mood: { ...(prev.mood || {}), ...(live.mood || {}) },
+            models: prev.models,
+          }
+        })
+        setRefreshedAt(Date.now())
       }, [])
 
       const loadDiary = React.useCallback(async () => {
@@ -102,13 +129,79 @@ window.__ModuleLoader__.load({
         }
       }, [apply, loadDiary])
 
+      // 每 1.5 秒问一次轻量快照：颤栗值、官位、日记、国库、资产、捕鱼数一变就重画
+      React.useEffect(() => {
+        let alive = true
+        const tick = async () => {
+          if (!alive || Date.now() < holdRef.current) return
+          try {
+            const res = await fetch('/heshen-pet/live', { credentials: 'same-origin', cache: 'no-store' })
+            const payload = await res.json()
+            if (!alive || !payload || !payload.ok) return
+            const stamp = String(payload.stamp || '')
+            const diaryStamp = String(payload.diaryStamp || '')
+            const stampChanged = stamp && stamp !== stampRef.current
+            const diaryChanged = diaryStamp && diaryStamp !== diaryStampRef.current
+            if (!stampChanged && !diaryChanged) return
+            if (Date.now() < holdRef.current) return
+            stampRef.current = stamp
+            if (stampChanged) {
+              // 模型换了要连清单一起重取，不然面板上只剩一个 id
+              const nextModel = (payload.settings && payload.settings.chatModel) || ''
+              if (modelRef.current && nextModel && nextModel !== modelRef.current) {
+                try {
+                  apply(await call())
+                } catch {
+                  /* 取不到清单就先用轻量快照顶着 */
+                }
+              }
+              modelRef.current = nextModel
+              mergeLive(payload.settings)
+            }
+            if (diaryChanged) {
+              diaryStampRef.current = diaryStamp
+              void loadDiary()
+            }
+          } catch {
+            /* 轮询失败就当这一拍没发生，下一拍再来 */
+          }
+        }
+        void tick()
+        const timer = setInterval(() => void tick(), 1500)
+        return () => {
+          alive = false
+          clearInterval(timer)
+        }
+      }, [apply, loadDiary, mergeLive])
+
+      const refresh = React.useCallback(async () => {
+        hold(1500)
+        setBusy(true)
+        setError('')
+        setSaved('')
+        try {
+          const payload = await call()
+          apply(payload)
+          await loadDiary()
+          diaryStampRef.current = ''
+          setRefreshedAt(Date.now())
+          if (payload && payload.ok) setSaved('账本重抄了一遍')
+        } catch (err) {
+          setError(String((err && err.message) || err))
+        } finally {
+          setBusy(false)
+        }
+      }, [apply, loadDiary])
+
       const save = React.useCallback(
         async (patch, note) => {
+          hold(1800)
           setError('')
           setSaved('')
           try {
             const payload = await call(patch)
             apply(payload)
+            setRefreshedAt(Date.now())
             if (payload && payload.ok) setSaved(note || '已保存')
           } catch (err) {
             setError(String((err && err.message) || err))
@@ -124,6 +217,7 @@ window.__ModuleLoader__.load({
       const models = Array.isArray(data.models) ? data.models : []
       const balance = data.balance || {}
       const sources = Array.isArray(balance.sources) ? balance.sources : []
+      const house = data.treasury || {}
 
       const formatAt = (ms) => {
         const t = Number(ms)
@@ -132,6 +226,26 @@ window.__ModuleLoader__.load({
         const pad = (n) => String(n).padStart(2, '0')
         return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
       }
+      const formatClock = (ms) => {
+        const t = Number(ms)
+        if (!t) return '—'
+        const d = new Date(t)
+        const pad = (n) => String(n).padStart(2, '0')
+        return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+      }
+      const money = (value) => {
+        const v = Number(value)
+        if (!Number.isFinite(v)) return '—'
+        return `¥${v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+      }
+      const stat = (name, value, note) =>
+        h(
+          'div',
+          { style: { display: 'flex', flexDirection: 'column', gap: '2px', minWidth: '104px' } },
+          h('span', { style: hint }, name),
+          h('span', { style: { fontSize: '17px', fontWeight: 600 } }, value),
+          note ? h('span', { style: hint }, note) : null,
+        )
 
       const burnPicked = async () => {
         if (!picked.length) return
@@ -399,7 +513,25 @@ window.__ModuleLoader__.load({
       return h(
         'div',
         { style: box },
-        h('h3', { style: title }, '和大人府邸'),
+        h(
+          'div',
+          { style: { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' } },
+          h('h3', { style: title }, '和大人府邸'),
+          h(
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
+            h(
+              'span',
+              { style: hint },
+              refreshedAt ? `账本翻到 ${formatClock(refreshedAt)} · 有变动自己会翻页` : '正盯着账本……',
+            ),
+            h(
+              'button',
+              { type: 'button', style: { ...miniBtn, opacity: busy ? 0.6 : 1 }, disabled: busy, onClick: () => void refresh() },
+              busy ? '正在重抄…' : '刷新',
+            ),
+          ),
+        ),
         h('p', { style: hint }, '奴才的府上：皇上要奴才见人还是躲着、个头多高、甩得多远、亏空多少就把奴才关进牢房、跟您说话使哪个脑子——都在这儿吩咐。'),
 
         h(
@@ -425,7 +557,10 @@ window.__ModuleLoader__.load({
               step: 5,
               value: Math.round((Number(data.scale) || 1) * 100),
               style: { flex: '1 1 160px' },
-              onChange: (e) => apply({ ok: true, settings: { ...data, scale: Number(e.target.value) / 100 } }),
+              onChange: (e) => {
+                hold(2500)
+                apply({ ok: true, settings: { ...data, scale: Number(e.target.value) / 100 } })
+              },
               onMouseUp: (e) => void save({ scale: Number(e.currentTarget.value) / 100 }),
               onTouchEnd: (e) => void save({ scale: Number(e.currentTarget.value) / 100 }),
             }),
@@ -441,7 +576,10 @@ window.__ModuleLoader__.load({
               step: 10,
               value: Number(data.throwSettleMs) || 50,
               style: { flex: '1 1 160px' },
-              onChange: (e) => apply({ ok: true, settings: { ...data, throwSettleMs: Number(e.target.value) } }),
+              onChange: (e) => {
+                hold(2500)
+                apply({ ok: true, settings: { ...data, throwSettleMs: Number(e.target.value) } })
+              },
               onMouseUp: (e) => void save({ throwSettleMs: Number(e.target.value) }),
               onTouchEnd: (e) => void save({ throwSettleMs: Number(e.currentTarget.value) }),
             }),
@@ -458,7 +596,10 @@ window.__ModuleLoader__.load({
               step: 0.01,
               value: Number(data.jailThreshold) || 0,
               style: { ...input, width: '110px' },
-              onChange: (e) => apply({ ok: true, settings: { ...data, jailThreshold: Number(e.target.value) } }),
+              onChange: (e) => {
+                hold(2500)
+                apply({ ok: true, settings: { ...data, jailThreshold: Number(e.target.value) } })
+              },
               onBlur: (e) => void save({ jailThreshold: Number(e.target.value) }, '阈值已改'),
             }),
             h('span', { style: hint }, '余额低于这个数就进牢房（0 = 不关）'),
@@ -486,8 +627,6 @@ window.__ModuleLoader__.load({
             '这里只显示当前用的模型。要换模型请在「与和大人说话」窗口顶部那个下拉里选——选完立刻生效，下次也记得。',
           ),
         ),
-
-        diaryBlock,
 
         h(
           'div',
@@ -548,22 +687,44 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { style: card },
-          h('span', { style: { opacity: 0.72 } }, '国库余额'),
           h(
             'div',
-            { style: { fontSize: '18px', fontWeight: 600 } },
-            balance.amount === null || balance.amount === undefined
-              ? '还没查到'
-              : `${balance.currency === 'USD' ? '$' : '¥'}${Number(balance.amount).toFixed(2)}`,
-            balance.label ? h('span', { style: { ...hint, marginLeft: '8px', fontWeight: 400 } }, `来自 ${balance.label}`) : null,
+            { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '10px', flexWrap: 'wrap' } },
+            h('span', { style: { fontSize: '15px', fontWeight: 600 } }, '和珅的家底'),
+            h('span', { style: hint }, '国库的银子奴才不敢动，抽的这点碎银、网住的鱼，都记在这儿'),
+          ),
+          h(
+            'div',
+            { style: { display: 'flex', gap: '22px', flexWrap: 'wrap' } },
+            stat(
+              '国库余额',
+              house.guoku === null || house.guoku === undefined
+                ? balance.amount === null || balance.amount === undefined
+                  ? '还没查到'
+                  : money(balance.amount)
+                : money(house.guoku),
+              balance.label ? `来自 ${balance.label}` : '还没查着来路',
+            ),
+            stat('和大人资产', Number.isFinite(Number(house.assets)) ? money(house.assets) : '—', '从国库里抽出来的存银'),
+            stat('累计抽成', Number.isFinite(Number(house.totalSiphoned)) ? money(house.totalSiphoned) : '—', '一笔一笔攒的'),
+            stat(
+              '捕鱼数量',
+              `${Number(house.fish) || 0} 条`,
+              house.fishAt ? `最近一条 ${formatAt(house.fishAt)}${house.fishSpeed ? ` · ${house.fishSpeed}px/s` : ''}` : '还没网着过',
+            ),
           ),
           h(
             'p',
             { style: hint },
-            '能查到外部 api/plan 的余额就先报它（OpenRouter / 月之暗面），查不到才报 DeepSeek。当前已配置：' +
+            '国库余额' +
+              (house.lastBalanceAt ? `查于 ${formatAt(house.lastBalanceAt)}；` : '；') +
+              '能查到外部 api/plan 的余额就先报它（OpenRouter / 月之暗面），查不到才报 DeepSeek。当前已配置：' +
               (sources.filter((s) => s.configured).map((s) => s.label).join('、') || '无'),
           ),
         ),
+
+        diaryBlock,
+
 
         error ? h('p', { style: { ...hint, color: '#e06c75' } }, error) : null,
         saved ? h('p', { style: hint }, saved) : null,

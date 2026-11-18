@@ -422,6 +422,7 @@ export function apply(ctx, rawConfig = {}) {
 
   async function settingsSnapshot() {
     const current = await readState()
+    await loadTreasury()
     const models = await listChatModels()
     const sources = await balanceSources()
     const active = chatModelsCache.selection || models.selection
@@ -439,11 +440,95 @@ export function apply(ctx, rawConfig = {}) {
         sources,
       },
       treasury: {
-        guoku: current.treasury?.guoku ?? null,
-        assets: current.treasury?.assets ?? null,
+        guoku: current.treasury?.guoku ?? treasury.lastBalance,
+        assets: current.treasury?.assets ?? treasury.assets,
+        totalSiphoned: treasury.totalSiphoned,
         fish: treasury.fish || 0,
+        fishAt: Number(treasury.fishHistory?.[0]?.at) || 0,
+        fishSpeed: Number(treasury.fishHistory?.[0]?.speed) || 0,
+        lastBalanceAt: Number(treasury.lastBalanceAt) || 0,
+        currency: current.treasury?.currency || 'CNY',
       },
       mood: publicView(await loadMood()),
+    }
+  }
+
+  /**
+   * 轻量实时快照：设置页每 1.5 秒问一次，只读内存和本地小文件，
+   * 不碰模型清单、不查凭据、不打网络——自动刷新不花钱。
+   * stamp 变了才让前端重画，没变就当什么都没发生。
+   */
+  async function liveSnapshot() {
+    await loadTreasury()
+    const current = await readState()
+    const mood = publicView(await loadMood())
+    const threshold = await readJailThreshold()
+    let diaryStamp = ''
+    try {
+      await memoryStore.load()
+      const snap = memoryStore.snapshot()
+      diaryStamp = [
+        snap.items.length,
+        snap.profile.length,
+        snap.catalog.length,
+        snap.totals.main,
+        snap.totals.shard,
+        snap.stats.totalTurns,
+      ].join(':')
+    } catch {}
+    const active = chatModelsCache.selection
+    const chatModel = active ? `${active.provider}/${active.model}` : String(current.chat?.modelId || '')
+    const stamp = [
+      current.visible !== false ? 1 : 0,
+      Number(current.scale) || 1,
+      Number(current.throwSettleMs) || 50,
+      threshold,
+      mood.rank,
+      mood.tremble,
+      mood.state,
+      mood.updatedAt,
+      treasury.lastBalance ?? '',
+      treasury.lastBalanceAt,
+      treasury.assets,
+      treasury.fish,
+      chatModel,
+      diaryStamp,
+    ].join('|')
+    return {
+      stamp,
+      diaryStamp,
+      settings: {
+        visible: current.visible !== false,
+        scale: Number(current.scale) || 1,
+        throwSettleMs: Number(current.throwSettleMs) || 50,
+        jailThreshold: threshold,
+        chatModel,
+        balance: {
+          label: current.treasury?.sourceLabel || '',
+          amount: current.treasury?.guoku ?? null,
+          currency: current.treasury?.currency || 'CNY',
+        },
+        treasury: {
+          guoku: current.treasury?.guoku ?? treasury.lastBalance,
+          assets: current.treasury?.assets ?? treasury.assets,
+          totalSiphoned: treasury.totalSiphoned,
+          fish: treasury.fish || 0,
+          fishAt: Number(treasury.fishHistory?.[0]?.at) || 0,
+          fishSpeed: Number(treasury.fishHistory?.[0]?.speed) || 0,
+          lastBalanceAt: Number(treasury.lastBalanceAt) || 0,
+          currency: current.treasury?.currency || 'CNY',
+        },
+        mood,
+      },
+    }
+  }
+
+  async function liveHandler(req, res) {
+    try {
+      sendJson(res, 200, { ok: true, ...(await liveSnapshot()) })
+    } catch (error) {
+      log.warn?.(`[heshen-pet] 实时快照失败：${error?.message || String(error)}`)
+      sendJson(res, 500, { ok: false, message: error?.message || String(error) })
     }
   }
 
@@ -540,9 +625,11 @@ export function apply(ctx, rawConfig = {}) {
       return () => {}
     }
     const offSettings = ws.register({ kind: 'exact', path: '/heshen-pet/settings', handler: settingsHandler })
+    const offLive = ws.register({ kind: 'exact', path: '/heshen-pet/live', handler: liveHandler })
     const offDiary = ws.register({ kind: 'exact', path: '/heshen-pet/diary', handler: diaryHandler })
     return () => {
       offSettings?.()
+      offLive?.()
       offDiary?.()
     }
   }, 'heshen-desktop-pet: 设置与日记接口')
