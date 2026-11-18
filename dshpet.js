@@ -12,7 +12,7 @@
 
 import { execFile } from 'node:child_process'
 import { createRequire } from 'node:module'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 const nodeRequire = createRequire(import.meta.url)
@@ -56,6 +56,32 @@ function stripJsonc(text) {
     .replace(/(^|[^:])\/\/.*$/gm, '$1')
 }
 
+/**
+ * 把 dsh-pet 的配置统一成「一定有 pets 数组」的形状。
+ *
+ * 老版本（单配置文件）返回 `{ pets: [...] }`；
+ * 新版（每份配置一个文件）返回 `{ "<配置文件名>": { ..., pets: [...] }, ... }`，
+ * 顶层 key 是配置文件名（如 main），宠物在它自己的 pets 数组里。
+ * 不认这两种形状就会「装了大肥鱼却读不到宠物」→ 门禁 no-fish-pet → 捕不到鱼。
+ */
+function normalizeConfig(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  if (Array.isArray(raw.pets)) return raw
+  const pets = []
+  for (const [key, value] of Object.entries(raw)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    if (Array.isArray(value.pets)) {
+      for (const pet of value.pets) {
+        if (pet && typeof pet === 'object') pets.push({ ...pet, configKey: key })
+      }
+    } else if (value.id || value.display) {
+      pets.push({ ...value, id: value.id || key, configKey: key })
+    }
+  }
+  if (!pets.length) return null
+  return { ...raw, pets }
+}
+
 /** 枚举 Windows 顶层窗口，取 DSH 那个窗口的客户区（物理像素） */
 const winprobe = nodeRequire('./app/winprobe.js')
 
@@ -78,7 +104,24 @@ async function runWindowProbe(timeout = 6000, needle = 'DeepSeek Harness') {
 }
 
 export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
-  const origin = String(process.env.DSH_WEB_URL || 'http://127.0.0.1:4348').replace(/\/+$/, '')
+  /**
+   * 宿主地址：优先 DSH_WEB_URL；没有就从 webServer 服务上现取端口。
+   * 写死 4348 只在本机碰巧对，别人装完端口不同就走不通 HTTP 兜底。
+   */
+  function resolveOrigin() {
+    const env = String(process.env.DSH_WEB_URL || '').trim()
+    if (env) return env.replace(/\/+$/, '')
+    try {
+      const ws = ctx?.get?.('webServer', false)
+      const candidates = [ws?.port, ws?.server?.address?.()?.port, ws?.options?.port, ws?.httpServer?.address?.()?.port]
+      for (const candidate of candidates) {
+        const port = Number(candidate)
+        if (Number.isFinite(port) && port > 0) return `http://127.0.0.1:${port}`
+      }
+    } catch {}
+    return 'http://127.0.0.1:4348'
+  }
+  const origin = resolveOrigin()
   const configFile = join(dshHome, 'dsh-pet', 'main-config.jsonc')
   let token = ''
   let tokenAt = 0
@@ -100,15 +143,34 @@ export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
     return token
   }
 
-  /** dsh-pet 挂在宿主 webServer 上的前缀路由 handler（/dsh-pet-7340） */
+  /** dsh-pet 挂在宿主 webServer 上的前缀路由 handler（通常 /dsh-pet-7340） */
   function internalRoute() {
     try {
       const ws = ctx?.get?.('webServer', false)
       const prefixes = ws?.prefixes
-      const entry = prefixes instanceof Map ? prefixes.get(`/${ROUTE}`) : prefixes?.[`/${ROUTE}`]
+      const key = `/${routeSegment()}`
+      const entry = prefixes instanceof Map ? prefixes.get(key) : prefixes?.[key]
       if (entry && typeof entry.handler === 'function') return entry.handler
     } catch {}
     return null
+  }
+
+  /**
+   * 路由段：从宿主已注册的前缀里现取，取不到才回退常量。
+   * 这样 dsh-pet 换版本（或换个挂载前缀）时不会因为写死的 `dsh-pet-7340` 直接失联。
+   */
+  let routeCache = { at: 0, value: ROUTE }
+  function routeSegment() {
+    if (Date.now() - routeCache.at < 5000) return routeCache.value
+    let value = ROUTE
+    try {
+      const found = petPlugins()
+      const hit = found.find((p) => p.kind === 'dsh-pet') || found[0]
+      const seg = hit ? String(hit.path || '').replace(/^\/+/, '').replace(/\/+$/, '') : ''
+      if (seg) value = seg
+    } catch {}
+    routeCache = { at: Date.now(), value }
+    return value
   }
 
   /**
@@ -181,11 +243,11 @@ export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
   }
 
   async function api(rest, { method = 'GET', body, timeout = 4000 } = {}) {
-    const internal = await internalCall(`/${ROUTE}/${rest}`, method, body)
+    const internal = await internalCall(`/${routeSegment()}/${rest}`, method, body)
     if (internal) return internal
     const t = authToken()
     const query = t ? `?token=${encodeURIComponent(t)}` : ''
-    const url = `${origin}/api/${ROUTE}/${rest}${query}`
+    const url = `${origin}/api/${routeSegment()}/${rest}${query}`
     const headers = {
       ...(body ? { 'content-type': 'application/json' } : {}),
       ...(t ? { 'X-DSH-Pet-Token': t } : {}),
@@ -208,24 +270,54 @@ export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
     return { status: res.status, ok: res.ok, json, text: text.slice(0, 400), via: sesFetch ? 'session' : 'fetch' }
   }
 
-  /** 读配置：优先走接口（带凭据），失败直接读磁盘上的 main-config.jsonc */
+  /**
+   * 磁盘兜底：老布局 `dsh-pet/main-config.jsonc`，新布局 `dsh-pet/pet/*-config.json(c)`
+   * （重装 dsh-pet 之后老的 main-config.jsonc 会消失，只剩 pet/ 目录）。
+   */
+  async function readConfigFiles() {
+    const candidates = [configFile, join(dshHome, 'dsh-pet', 'pet')]
+    const found = []
+    for (const candidate of candidates) {
+      try {
+        const info = await stat(candidate)
+        if (info.isFile()) {
+          try {
+            const norm = normalizeConfig(JSON.parse(stripJsonc(await readFile(candidate, 'utf8'))))
+            if (norm) found.push(norm)
+          } catch {}
+        } else if (info.isDirectory()) {
+          let entries = []
+          try {
+            entries = await readdir(candidate)
+          } catch {}
+          for (const entry of entries) {
+            if (!/\.jsonc?$/i.test(entry)) continue
+            try {
+              const norm = normalizeConfig(JSON.parse(stripJsonc(await readFile(join(candidate, entry), 'utf8'))))
+              if (norm) found.push(norm)
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+    if (!found.length) return null
+    return { pets: found.flatMap((c) => c.pets) }
+  }
+
+  /** 读配置：优先走接口（带凭据），失败再读磁盘 */
   async function readConfig({ force = false } = {}) {
     if (!force && configCache.value && Date.now() - configCache.at < 4000) return configCache.value
     let config = null
     let source = 'api'
     try {
       const res = await api('config')
-      if (res.ok && res.json && Array.isArray(res.json.pets)) config = res.json
+      if (res.ok && res.json) config = normalizeConfig(res.json)
     } catch (error) {
       log.warn?.(`[heshen-pet] 读 dsh-pet 配置失败：${error?.message || String(error)}`)
     }
     if (!config) {
       source = 'file'
-      try {
-        config = JSON.parse(stripJsonc(await readFile(configFile, 'utf8')))
-      } catch {
-        config = null
-      }
+      config = await readConfigFiles()
     }
     const value = { config, source, at: Date.now() }
     configCache = { at: Date.now(), value }
@@ -278,6 +370,21 @@ export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
     const { config, source } = await readConfig({ force })
     const pet = pickPet(config)
     if (!pet) {
+      // 配置**完全读不到**（dsh-pet 换了配置格式/路径）：不能判成「没有宠物」，
+      // 那等于把捕鱼功能整个关掉。插件在就按「她应该在」放行，
+      // 真正的可见性交给窗口探测 + 像素扫描；扫不到就只是这一轮没框。
+      if (!config) {
+        log.warn?.(`[heshen-pet] 读不到 dsh-pet 配置（source=${source}）：按宠物存在处理，门禁照开`)
+        return done({
+          open: true,
+          reason: 'config-unknown',
+          plugin: plugins[0].kind,
+          petId: 'main',
+          display: 'unknown',
+          source,
+          at,
+        })
+      }
       return done({ open: false, reason: 'no-fish-pet', plugin: plugins[0].kind, petId: '', display: '', source, at })
     }
     const display = String(pet.display || 'web')
@@ -412,28 +519,50 @@ export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
     }
   }
 
-  /** 退路：直接改 dsh-pet 的配置文件（页/桌面端下次读配置时生效） */
+  /**
+   * 退路：直接改 dsh-pet 的配置文件（页/桌面端下次读配置时生效）。
+   * 老布局是单文件 main-config.jsonc；新版是 pet/*-config.json(c) 每份配置一个文件，
+   * 所以这里按「谁里面装着这只宠物就改谁」来找，不假设路径。
+   */
   async function writeDisplayToFile(petId, display) {
+    const petDir = join(dshHome, 'dsh-pet', 'pet')
+    const targets = [configFile]
     try {
-      const raw = await readFile(configFile, 'utf8')
-      const config = JSON.parse(stripJsonc(raw))
-      const pets = Array.isArray(config.pets) ? config.pets : []
-      let hit = false
-      for (const p of pets) {
-        if (String(p?.id) === petId) {
-          p.display = display
-          hit = true
-        }
+      const entries = await readdir(petDir)
+      for (const entry of entries) {
+        if (/\.jsonc?$/i.test(entry)) targets.push(join(petDir, entry))
       }
-      if (!hit) return false
-      await mkdir(dirname(configFile), { recursive: true })
-      await writeFile(configFile, JSON.stringify(config, null, 2), 'utf8')
-      configCache = { at: 0, value: null }
-      return true
-    } catch (error) {
-      log.warn?.(`[heshen-pet] 写 dsh-pet 配置失败：${error?.message || String(error)}`)
-      return false
+    } catch {}
+    for (const file of targets) {
+      try {
+        const parsed = JSON.parse(stripJsonc(await readFile(file, 'utf8')))
+        let hit = false
+        const walk = (node) => {
+          if (!node || typeof node !== 'object') return
+          if (Array.isArray(node)) {
+            for (const item of node) walk(item)
+            return
+          }
+          if (Array.isArray(node.pets)) {
+            for (const pet of node.pets) {
+              if (String(pet?.id) === petId) {
+                pet.display = display
+                hit = true
+              }
+            }
+          }
+          for (const value of Object.values(node)) walk(value)
+        }
+        walk(parsed)
+        if (!hit) continue
+        await mkdir(dirname(file), { recursive: true })
+        await writeFile(file, JSON.stringify(parsed, null, 2), 'utf8')
+        configCache = { at: 0, value: null }
+        return true
+      } catch {}
     }
+    log.warn?.(`[heshen-pet] 写 dsh-pet 配置失败：没找到包含 ${petId} 的配置文件`)
+    return false
   }
 
   /** 关掉大肥鱼（display=none）：先走接口，接口没权限就改配置文件 */
@@ -516,7 +645,7 @@ export function createDshPetBridge({ ctx, dshHome, log = console } = {}) {
         return null
       }
     }
-    const base = `${origin}/api/${ROUTE}/state`
+    const base = `${origin}/api/${routeSegment()}/state`
     await tryFetch('api-plain', base, {})
     if (t) {
       const entry = await tryFetch('entry', `${origin}/?token=${encodeURIComponent(t)}`, {})

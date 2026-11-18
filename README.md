@@ -93,6 +93,26 @@ dsh-hedaren-pet/
 
 `app/winprobe.js` 仅剩宿主侧用来估算兜底框。
 
+## 设置（DSH 设置 → 和大人府邸）
+
+桌宠的所有可调项都在 DSH 设置页里的「和大人府邸」栏目（`settings.section`，`client/client.js`）：
+
+| 项 | 说明 |
+| --- | --- |
+| 桌宠显示 | 显示/隐藏（等价于菜单里的显示、隐藏） |
+| 大小 | 70%–150%（写 `state.scale`） |
+| 甩飞阈值 | 50–500 ms，松手前静止超过这么久才甩出去 |
+| 亏空阈值 | 余额低于它就进牢房，0 = 不关 |
+| 对话模型 | DSH 里所有配置好的 `provider/model`，选中即生效（聊天窗里也能换） |
+| 国库余额 | 当前余额与来源 |
+
+数据接口是宿主插件注册的同源路由 `GET/POST /heshen-pet/settings`。右键菜单里只剩动作（说话、国库、记忆账本、动画、退出）。
+
+## 对话模型与余额
+
+- 对话走 DSH 的 `llm` 服务：`llm.listProviders()` + `llm.listModels(provider)` 列出现有模型，`llm.stream({provider, model, ...})` 调用；凭据由 DSH 的 provider 适配器管。调不通才回退官方 `api.deepseek.com`（再不行回退 `arkcli-agent-plan` 的火山接口）。
+- 余额按来源链查：**OpenRouter 额度 → 月之暗面余额 → DeepSeek 余额**。谁配了凭据且查得到就报谁（`state.treasury.sourceLabel` 会写明来源），都查不到时就是原来那版显示的 DeepSeek 余额。
+
 ## 捕鱼的前置条件（门禁）
 
 捕鱼不是永远在跑。只有同时满足下面三条才会做窗口探测与像素扫描：

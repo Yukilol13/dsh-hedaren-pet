@@ -163,63 +163,16 @@ function renderMain() {
   category = null
   menu.innerHTML = ''
   menu.appendChild(el('div', { className: 'muted', text: '和大人' }))
-
-  const row = el('div', { className: 'scaleRow' })
-  row.appendChild(el('span', { text: '大小' }))
-  const range = el('input', {
-    type: 'range',
-    min: '70',
-    max: '150',
-    step: '5',
-    value: String(Math.round(scale * 100)),
-  })
-  const val = el('span', { id: 'scaleVal', text: `${Math.round(scale * 100)}%` })
-  range.addEventListener('input', () => {
-    scaleDragging = true
-    scale = Number(range.value) / 100
-    val.textContent = `${Math.round(scale * 100)}%`
-    window.heshen.menuAction({ action: 'scale', data: { scale } })
-  })
-  range.addEventListener('change', () => {
-    scaleDragging = false
-  })
-  row.appendChild(range)
-  row.appendChild(val)
-  menu.appendChild(row)
-
-  // 甩飞阈值：松手前静止/只在原地晃超过这么久就不甩飞（50–500ms）
-  const srow = el('div', { className: 'scaleRow' })
-  srow.title = '松手前指针静止（或只在原地小幅晃动）超过这个时长就不甩飞'
-  srow.appendChild(el('span', { text: '甩飞阈值' }))
-  const srange = el('input', {
-    type: 'range',
-    min: String(SETTLE_MIN),
-    max: String(SETTLE_MAX),
-    step: '10',
-    value: String(throwSettleMs),
-  })
-  const sval = el('span', { id: 'settleVal', text: `${throwSettleMs}ms` })
-  srange.addEventListener('input', () => {
-    throwSettleMs = Math.max(SETTLE_MIN, Math.min(SETTLE_MAX, Number(srange.value) || SETTLE_MIN))
-    sval.textContent = `${throwSettleMs}ms`
-    window.heshen.menuAction({ action: 'settle', data: { ms: throwSettleMs } })
-  })
-  srow.appendChild(srange)
-  srow.appendChild(sval)
-  menu.appendChild(srow)
+  // 大小 / 甩飞阈值 / 亏空阈值 这些设置项都搬去「DSH 设置 → 和大人府邸」了，菜单只留动作。
+  menu.appendChild(
+    el('div', { className: 'muted', text: '设置：DSH 设置 → 和大人府邸' }),
+  )
 
   menu.appendChild(
     el('button', { className: 'cat', text: '与和大人说话 ', onclick: () => act({ action: 'chat' }) }),
   )
   menu.appendChild(
     el('button', { className: 'cat', text: '查看国库 ', onclick: () => act({ action: 'treasury' }) }),
-  )
-  menu.appendChild(
-    el('button', {
-      className: 'cat',
-      text: `亏空阈值：${jailThreshold > 0 ? jailThreshold.toFixed(2) : '未设置'} `,
-      onclick: () => act({ action: 'jail-threshold' }),
-    }),
   )
   menu.appendChild(
     el('button', { className: 'cat', text: '记忆账本 ', onclick: () => act({ action: 'memory' }) }),

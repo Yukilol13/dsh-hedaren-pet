@@ -40,6 +40,42 @@
     display: flex; flex-direction: column; gap: 7px;
     line-height: 1.5; overscroll-behavior: contain;
   }
+  #modelRow {
+    display: flex; align-items: center; gap: 6px;
+    padding: 5px 8px 2px;
+    -webkit-app-region: no-drag;
+  }
+  #modelRow label { font-size: 11px; color: rgba(246,241,230,.62); flex: 0 0 auto; }
+  /* 自己画下拉：原生 <select> 的弹层是白底黑字，和这里的灰底白字对不上 */
+  #modelPick { position: relative; flex: 1 1 auto; min-width: 0; }
+  #modelBtn {
+    width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 6px;
+    background: #30343c; color: #f6f1e6;
+    border: 1px solid rgba(212,175,55,.25); border-radius: 8px;
+    font: inherit; font-size: 11px; padding: 3px 7px; cursor: pointer;
+    white-space: nowrap; overflow: hidden;
+  }
+  #modelBtn:hover { border-color: rgba(212,175,55,.5); }
+  #modelLabel { overflow: hidden; text-overflow: ellipsis; }
+  #modelCaret { opacity: .6; font-size: 9px; flex: 0 0 auto; }
+  #modelList {
+    position: absolute; left: 0; right: 0; top: calc(100% + 4px);
+    z-index: 20; max-height: 210px; overflow-y: auto;
+    background: #30343c; color: #f6f1e6;
+    border: 1px solid rgba(212,175,55,.3); border-radius: 8px;
+    box-shadow: 0 12px 28px rgba(0,0,0,.55);
+    padding: 3px;
+  }
+  #modelList[hidden] { display: none; }
+  .modelItem {
+    display: block; width: 100%; text-align: left;
+    background: transparent; color: #f6f1e6;
+    border: 0; border-radius: 6px; padding: 5px 7px;
+    font: inherit; font-size: 11px; cursor: pointer;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .modelItem:hover { background: #3c414b; color: #ffffff; }
+  .modelItem.on { background: rgba(212,175,55,.22); color: #ffeec2; }
   .msg { max-width: 88%; padding: 7px 11px; border-radius: 11px; white-space: pre-wrap; word-break: break-word; }
   .msg.user { align-self: flex-end; background: rgba(212,175,55,.22); color: #ffeec2; }
   .msg.assistant { align-self: flex-start; background: rgba(255,255,255,.07); }
@@ -64,6 +100,15 @@
 <body>
 <div id="panel">
   <div id="head"><span>与和大人说话（您就是皇上）</span><button id="close" type="button">×</button></div>
+  <div id="modelRow">
+    <label for="modelBtn">用哪个模型</label>
+    <div id="modelPick">
+      <button id="modelBtn" type="button">
+        <span id="modelLabel">…</span><span id="modelCaret">▼</span>
+      </button>
+      <div id="modelList" hidden></div>
+    </div>
+  </div>
   <div id="log"></div>
   <div id="row">
     <textarea id="input" rows="1" placeholder="皇上请讲，奴才听着呢……"></textarea>
@@ -76,9 +121,61 @@ const log = $('#log')
 const input = $('#input')
 const send = $('#send')
 const closeBtn = $('#close')
+const modelBtn = $('#modelBtn')
+const modelLabel = $('#modelLabel')
+const modelList = $('#modelList')
 
 let state = { chat: { messages: [], pending: null } }
 let lastSig = ''
+let lastModelsSig = ''
+let modelsOpen = false
+
+function labelOf(m) {
+  return `${m.providerName || ''} · ${m.name || m.id}`.replace(/^ · /, '')
+}
+
+function setListOpen(open) {
+  modelsOpen = open
+  modelList.hidden = !open
+}
+
+function renderModels() {
+  const chat = state.chat || {}
+  const models = Array.isArray(chat.models) ? chat.models : []
+  const activeId = chat.modelId || ''
+  const sig = `${models.map((m) => m.id).join('|')}#${activeId}`
+  if (sig === lastModelsSig) return
+  lastModelsSig = sig
+  modelList.innerHTML = ''
+  if (!models.length) {
+    modelLabel.textContent = '（没读到配置好的模型）'
+    modelBtn.disabled = true
+    setListOpen(false)
+    return
+  }
+  modelBtn.disabled = false
+  const active = models.find((m) => m.id === activeId)
+  modelLabel.textContent = active ? labelOf(active) : labelOf(models[0])
+  for (const m of models) {
+    const item = document.createElement('button')
+    item.type = 'button'
+    item.className = 'modelItem' + (m.id === activeId ? ' on' : '')
+    item.textContent = labelOf(m)
+    item.title = m.id
+    item.addEventListener('click', () => {
+      setListOpen(false)
+      void chooseModel(m.id)
+    })
+    modelList.appendChild(item)
+  }
+}
+
+async function chooseModel(id) {
+  const chat = state.chat || {}
+  if (!id || id === chat.modelId) return
+  const next = await window.heshen.writeState({ chat: { ...chat, modelId: id } })
+  await apply(next)
+}
 
 function render() {
   const chat = state.chat || {}
@@ -104,6 +201,7 @@ function render() {
     log.scrollTop = log.scrollHeight
   }
   send.disabled = Boolean(pendingId)
+  renderModels()
 }
 
 async function apply(next) {
@@ -128,6 +226,15 @@ async function sendMessage() {
 }
 
 send.addEventListener('click', () => void sendMessage())
+modelBtn.addEventListener('click', (e) => {
+  e.stopPropagation()
+  setListOpen(!modelsOpen)
+})
+document.addEventListener('click', (e) => {
+  if (!modelsOpen) return
+  if (modelBtn.contains(e.target) || modelList.contains(e.target)) return
+  setListOpen(false)
+})
 closeBtn.addEventListener('click', () => window.heshen.closeChat())
 input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {

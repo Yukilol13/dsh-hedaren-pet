@@ -377,6 +377,134 @@ export function apply(ctx, rawConfig = {}) {
   const JAIL_LINE = '小月！莫愁！你们什么时候来救我啊！'
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+  // ---------- 设置页数据（DSH 设置 → 和大人府邸） ----------
+  async function writeJailThreshold(value) {
+    const v = Math.round(Number(value) * 100) / 100
+    const safe = Number.isFinite(v) && v >= 0 && v <= 10000 ? v : DEFAULT_JAIL_THRESHOLD
+    await mkdir(dirname(jailThresholdFile), { recursive: true })
+    await writeFile(jailThresholdFile, JSON.stringify({ value: safe, updatedAt: Date.now() }, null, 2), 'utf8')
+    await writeState({ jailThreshold: safe })
+    return safe
+  }
+
+  async function settingsSnapshot() {
+    const current = await readState()
+    const models = await listChatModels()
+    const sources = await balanceSources()
+    const active = chatModelsCache.selection || models.selection
+    return {
+      visible: current.visible !== false,
+      scale: Number(current.scale) || 1,
+      throwSettleMs: Number(current.throwSettleMs) || 50,
+      jailThreshold: await readJailThreshold(),
+      chatModel: active ? `${active.provider}/${active.model}` : '',
+      models: models.list.map((m) => ({ id: m.id, name: m.name, providerName: m.providerName })),
+      balance: {
+        label: current.treasury?.sourceLabel || '',
+        amount: current.treasury?.guoku ?? null,
+        currency: current.treasury?.currency || 'CNY',
+        sources,
+      },
+      treasury: {
+        guoku: current.treasury?.guoku ?? null,
+        assets: current.treasury?.assets ?? null,
+        fish: treasury.fish || 0,
+      },
+    }
+  }
+
+  function readJsonBody(req, limit = 64 * 1024) {
+    return new Promise((resolve) => {
+      let text = ''
+      let done = false
+      const finish = (value) => {
+        if (done) return
+        done = true
+        try {
+          resolve(value)
+        } catch {}
+      }
+      req.on('data', (chunk) => {
+        text += chunk
+        if (text.length > limit) finish(null)
+      })
+      req.on('end', () => {
+        try {
+          finish(text ? JSON.parse(text) : {})
+        } catch {
+          finish(null)
+        }
+      })
+      req.on('error', () => finish(null))
+    })
+  }
+
+  function sendJson(res, status, value) {
+    try {
+      const body = JSON.stringify(value)
+      res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      res.end(body)
+    } catch (error) {
+      log.warn?.(`[heshen-pet] 设置页响应失败：${error?.message || String(error)}`)
+      try {
+        res.end()
+      } catch {}
+    }
+  }
+
+  async function settingsHandler(req, res) {
+    try {
+      if (req.method === 'POST' || req.method === 'PUT') {
+        const body = await readJsonBody(req)
+        if (!body || typeof body !== 'object') {
+          sendJson(res, 400, { ok: false, message: '请求体不是合法 JSON' })
+          return
+        }
+        if (Object.prototype.hasOwnProperty.call(body, 'visible')) {
+          await writeState({ visible: Boolean(body.visible) })
+        }
+        if (Object.prototype.hasOwnProperty.call(body, 'throwSettleMs')) {
+          const ms = Math.min(500, Math.max(50, Math.round(Number(body.throwSettleMs) || 50)))
+          await writeState({ throwSettleMs: ms })
+        }
+        if (Object.prototype.hasOwnProperty.call(body, 'scale')) {
+          const scale = Math.min(1.5, Math.max(0.7, Number(body.scale) || 1))
+          await writeState({ scale: Math.round(scale * 100) / 100 })
+        }
+        if (Object.prototype.hasOwnProperty.call(body, 'jailThreshold')) {
+          await writeJailThreshold(body.jailThreshold)
+        }
+        if (Object.prototype.hasOwnProperty.call(body, 'chatModel')) {
+          const id = String(body.chatModel || '').trim()
+          const models = await listChatModels({ force: true })
+          const hit = models.list.find((m) => m.id === id)
+          if (!hit) {
+            sendJson(res, 400, { ok: false, message: `没有这个模型：${id}` })
+            return
+          }
+          await writeChatSelection(hit)
+          chatModelsCache = { at: 0, list: models.list, selection: hit }
+          lastSeenChatModelId = id
+        }
+        sendJson(res, 200, { ok: true, settings: await settingsSnapshot() })
+        return
+      }
+      sendJson(res, 200, { ok: true, settings: await settingsSnapshot() })
+    } catch (error) {
+      log.warn?.(`[heshen-pet] 设置页处理失败：${error?.message || String(error)}`)
+      sendJson(res, 500, { ok: false, message: error?.message || String(error) })
+    }
+  }
+
+  ctx.effect(() => {
+    const ws = ctx.get('webServer', false)
+    if (!ws || typeof ws.register !== 'function') {
+      log.warn?.('[heshen-pet] 没有 webServer，设置页拿不到数据')
+      return () => {}
+    }
+    return ws.register({ kind: 'exact', path: '/heshen-pet/settings', handler: settingsHandler })
+  }, 'heshen-desktop-pet: 设置接口')
+
   // ---------- 国库 / 和大人资产 ----------
   const treasuryFile = join(dshHome(), 'heshen-pet', 'desktop-treasury.json')
   const treasury = {
@@ -499,7 +627,77 @@ export function apply(ctx, rawConfig = {}) {
     return first ? { currency: first[0], total: first[1] } : null
   }
 
-  async function queryBalance() {
+  /**
+   * 外部余额来源（有凭据才试）。
+   * 顺序：第三方 API/Plan → DeepSeek 余额。能查到谁就报谁的数，
+   * 都对不上才回退到「原来那版显示的 DeepSeek 余额」。
+   */
+  const EXTERNAL_BALANCE_SOURCES = [
+    {
+      id: 'openrouter',
+      label: 'OpenRouter',
+      currency: 'USD',
+      keys: ['OPENROUTER_API_KEY'],
+      async read(key) {
+        const res = await fetch('https://openrouter.ai/api/v1/credits', {
+          headers: { authorization: `Bearer ${key}` },
+          signal: AbortSignal.timeout(8000),
+        })
+        if (!res.ok) return null
+        const payload = await res.json()
+        const total = Number(payload?.data?.total_credits)
+        const used = Number(payload?.data?.total_usage)
+        if (!Number.isFinite(total)) return null
+        return { total: Math.max(0, total - (Number.isFinite(used) ? used : 0)) }
+      },
+    },
+    {
+      id: 'moonshot',
+      label: '月之暗面 Kimi',
+      currency: 'CNY',
+      keys: ['MOONSHOT_API_KEY', 'KIMI_API_KEY'],
+      async read(key) {
+        const res = await fetch('https://api.moonshot.cn/v1/users/me/balance', {
+          headers: { authorization: `Bearer ${key}` },
+          signal: AbortSignal.timeout(8000),
+        })
+        if (!res.ok) return null
+        const payload = await res.json()
+        const value = Number(payload?.data?.available_balance)
+        return Number.isFinite(value) ? { total: value } : null
+      },
+    },
+  ]
+
+  /** 哪些外部来源已经配好了凭据（给设置页展示用） */
+  async function balanceSources() {
+    const out = []
+    for (const source of EXTERNAL_BALANCE_SOURCES) {
+      let configured = false
+      for (const key of source.keys) {
+        try {
+          if ((await ctx.credentials.resolve(key))?.value) {
+            configured = true
+            break
+          }
+        } catch {}
+      }
+      out.push({ id: source.id, label: source.label, currency: source.currency, configured })
+    }
+    let deepseek = false
+    try {
+      const account = ctx.get('deepseekAccount', false)
+      deepseek = Boolean(account && typeof account.getBalance === 'function')
+    } catch {}
+    let deepseekKey = false
+    try {
+      deepseekKey = Boolean((await ctx.credentials.resolve('DEEPSEEK_API_KEY'))?.value)
+    } catch {}
+    out.push({ id: 'deepseek', label: 'DeepSeek', currency: 'CNY', configured: deepseek || deepseekKey })
+    return out
+  }
+
+  async function queryDeepseekBalance() {
     try {
       const account = ctx.get('deepseekAccount', false)
       if (account && typeof account.getBalance === 'function') {
@@ -533,6 +731,37 @@ export function apply(ctx, rawConfig = {}) {
       log.warn?.(`[heshen-pet] 官方余额查询失败：${error?.message || String(error)}`)
       return null
     }
+  }
+
+  /**
+   * 余额：先试外部 api/plan（配了凭据才试），都不行回退 DeepSeek。
+   * 返回值带 source/label，窗口与工具里能看出这笔钱是哪个账户的。
+   */
+  async function queryBalance() {
+    for (const source of EXTERNAL_BALANCE_SOURCES) {
+      let key = ''
+      for (const name of source.keys) {
+        try {
+          const resolved = await ctx.credentials.resolve(name)
+          if (resolved?.value) {
+            key = resolved.value
+            break
+          }
+        } catch {}
+      }
+      if (!key) continue
+      try {
+        const result = await source.read(key)
+        if (result && Number.isFinite(result.total)) {
+          return { currency: source.currency, total: result.total, source: source.id, label: source.label }
+        }
+      } catch (error) {
+        log.warn?.(`[heshen-pet] ${source.label} 余额查询失败：${error?.message || String(error)}`)
+      }
+    }
+    const deepseek = await queryDeepseekBalance()
+    if (deepseek) return { ...deepseek, source: 'deepseek', label: 'DeepSeek' }
+    return null
   }
 
   async function refreshTreasury({ manual = false } = {}) {
@@ -569,6 +798,10 @@ export function apply(ctx, rawConfig = {}) {
         guoku: treasury.lastBalance,
         assets: treasury.assets,
         lastCut: cut,
+        // 余额来源：外部 api/plan 查到了就标它，否则是 DeepSeek
+        source: balance.source || 'deepseek',
+        sourceLabel: balance.label || 'DeepSeek',
+        currency: balance.currency || 'CNY',
         updatedAt: Date.now(),
       },
     })
@@ -619,7 +852,142 @@ export function apply(ctx, rawConfig = {}) {
   const MEMORY_HINT =
     '以上是你的记忆（画像、目录、命中的分记忆）。用得上就自然带一句「奴才记得……」，用不上别硬提；记忆里没有的事，别编。'
 
+  // ---------- 对话模型：列出 DSH 里已经配置好的模型，允许挑一个 ----------
+  const CHAT_MODEL_FILE = () => join(dshHome(), 'heshen-pet', 'chat-model.json')
+  let chatModelsCache = { at: 0, list: [], selection: null }
+
+  /** DSH 当前的默认模型（没选过就用它） */
+  function defaultSelection() {
+    try {
+      const svc = ctx.get('agentDefaultModel', false)
+      const sel = typeof svc?.currentSelection === 'function' ? svc.currentSelection() : null
+      if (sel && sel.provider && sel.model) return { provider: String(sel.provider), model: String(sel.model) }
+    } catch {}
+    return null
+  }
+
+  async function readChatSelection() {
+    try {
+      const raw = JSON.parse(await readFile(CHAT_MODEL_FILE(), 'utf8'))
+      if (raw?.provider && raw?.model) return { provider: String(raw.provider), model: String(raw.model) }
+    } catch {}
+    return null
+  }
+
+  async function writeChatSelection(selection) {
+    try {
+      await mkdir(dirname(CHAT_MODEL_FILE()), { recursive: true })
+      await writeFile(
+        CHAT_MODEL_FILE(),
+        JSON.stringify({ provider: selection.provider, model: selection.model, updatedAt: Date.now() }, null, 2),
+        'utf8',
+      )
+      chatModelsCache = { at: 0, list: chatModelsCache.list, selection: null }
+      return true
+    } catch (error) {
+      log.warn?.(`[heshen-pet] 保存对话模型失败：${error?.message || String(error)}`)
+      return false
+    }
+  }
+
+  /**
+   * DSH 里所有「装了适配器 + 有模型」的 provider/model 组合。
+   * 这份清单直接喂给聊天窗的下拉框，选中的那条用于对话。
+   */
+  async function listChatModels({ force = false } = {}) {
+    if (!force && chatModelsCache.selection && Date.now() - chatModelsCache.at < 60000) return chatModelsCache
+    const list = []
+    const llm = ctx.get('llm', false)
+    if (llm && typeof llm.listProviders === 'function') {
+      let providers = []
+      try {
+        providers = (await llm.listProviders()).map((p) => ({ id: String(p.id), name: String(p.name || p.id) }))
+      } catch (error) {
+        log.warn?.(`[heshen-pet] 列模型失败（providers）：${error?.message || String(error)}`)
+      }
+      for (const provider of providers) {
+        let models = []
+        try {
+          models = await llm.listModels(provider.id)
+        } catch (error) {
+          log.warn?.(`[heshen-pet] 列模型失败（${provider.id}）：${error?.message || String(error)}`)
+          continue
+        }
+        for (const model of models || []) {
+          const id = String(model.id)
+          if (!id) continue
+          list.push({
+            id: `${provider.id}/${id}`,
+            provider: provider.id,
+            providerName: provider.name,
+            model: id,
+            name: String(model.name || id),
+          })
+        }
+      }
+    }
+    const saved = await readChatSelection()
+    const wanted = saved || defaultSelection()
+    const hit = wanted ? list.find((x) => x.provider === wanted.provider && x.model === wanted.model) : null
+    const selection = hit || list[0] || null
+    chatModelsCache = { at: Date.now(), list, selection, saved, wanted }
+    return chatModelsCache
+  }
+
+  /** 走 DSH 的 llm 服务调一次（流式收文本），失败返回 '' 让调用方回退 */
+  async function callViaHarness(messages, maxTokens, selection) {
+    const llm = ctx.get('llm', false)
+    if (!llm || typeof llm.stream !== 'function' || !selection) return { text: '', failure: '' }
+    const system = messages
+      .filter((m) => m.role === 'system')
+      .map((m) => String(m.content ?? ''))
+      .join('\n\n')
+    const rest = messages
+      .filter((m) => m.role !== 'system')
+      .map((m) => ({
+        role: m.role === 'assistant' ? 'assistant' : 'user',
+        content: [{ type: 'text', text: String(m.content ?? '') }],
+      }))
+    let text = ''
+    let fallbackText = ''
+    let failure = ''
+    try {
+      const options = {
+        provider: selection.provider,
+        model: selection.model,
+        messages: rest,
+        maxTokens,
+        temperature: 1.15,
+        signal: AbortSignal.timeout(60000),
+      }
+      if (system) options.system = system
+      for await (const chunk of llm.stream(options)) {
+        if (!chunk || typeof chunk !== 'object') continue
+        if (chunk.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
+        else if (chunk.type === 'block-end' && chunk.block?.type === 'text') fallbackText += String(chunk.block.text || '')
+        else if (chunk.type === 'finish' && chunk.reason?.kind === 'error') {
+          failure = chunk.reason.failure?.message || '模型调用失败'
+        }
+      }
+    } catch (error) {
+      failure = error?.message || String(error)
+    }
+    return { text: (text || fallbackText).trim(), failure }
+  }
+
   async function callChat(messages, maxTokens = 420) {
+    // 1) 先用「挑中的那个模型」（DSH 里配好的任意 provider/model）
+    const { selection } = await listChatModels()
+    if (selection) {
+      const viaHarness = await callViaHarness(messages, maxTokens, selection)
+      if (viaHarness.text) return viaHarness.text
+      if (viaHarness.failure) {
+        log.warn?.(
+          `[heshen-pet] 模型 ${selection.provider}/${selection.model} 调用失败：${viaHarness.failure}，回退官方接口`,
+        )
+      }
+    }
+    // 2) 回退：原来的 DeepSeek / arkcli 直连
     const key = (await ctx.credentials.resolve('DEEPSEEK_API_KEY'))?.value
     if (key) {
       const res = await fetch('https://api.deepseek.com/chat/completions', {
@@ -736,6 +1104,8 @@ export function apply(ctx, rawConfig = {}) {
   let lastChatPendingId = 0
   let lastTreasuryRefreshAt = 0
   let lastMemoryViewAt = -1 // -1 = 首次轮询只记基线，不弹账本
+  let lastChatModelsSignature = ''
+  let lastSeenChatModelId = null
 
   ctx.effect(() => {
     let stopped = false
@@ -745,6 +1115,43 @@ export function apply(ctx, rawConfig = {}) {
       Promise.resolve()
         .then(async () => {
           const current = await readState()
+          // 聊天窗里的模型下拉：窗口把选择写进 state.chat.modelId。
+          // 只在窗口那侧的值「变了」的时候才落盘——否则设置页刚改过的模型
+          // 会被窗口里那个旧值每轮覆盖回去（就是「设置里选模型不生效」的原因）。
+          try {
+            const models = await listChatModels()
+            const wanted = String(current.chat?.modelId || '').trim()
+            if (lastSeenChatModelId === null) {
+              lastSeenChatModelId = wanted || (models.selection ? `${models.selection.provider}/${models.selection.model}` : '')
+            }
+            const fromWindow = wanted !== lastSeenChatModelId
+            if (fromWindow) lastSeenChatModelId = wanted
+            if (fromWindow && wanted && models.list.some((m) => m.id === wanted)) {
+              const sel = models.list.find((m) => m.id === wanted)
+              if (!models.selection || models.selection.id !== wanted) {
+                await writeChatSelection(sel)
+                chatModelsCache = { at: 0, list: models.list, selection: sel }
+                lastSeenChatModelId = wanted
+                log.info?.(`[heshen-pet] 对话模型改为 ${wanted}（来自聊天窗）`)
+              }
+            }
+            const active = chatModelsCache.selection || models.selection
+            const activeId = active ? `${active.provider}/${active.model}` : ''
+            const signature = `${models.list.map((m) => m.id).join('|')}#${activeId}`
+            if (signature !== lastChatModelsSignature) {
+              lastChatModelsSignature = signature
+              await writeState({
+                chat: {
+                  ...(current.chat || {}),
+                  models: models.list.map((m) => ({ id: m.id, name: m.name, providerName: m.providerName })),
+                  modelId: activeId,
+                  modelName: active ? `${active.providerName} · ${active.name}` : '',
+                },
+              })
+            }
+          } catch (error) {
+            log.warn?.(`[heshen-pet] 同步模型清单失败：${error?.message || String(error)}`)
+          }
           const pending = current.chat?.pending
           if (pending && pending.id && Number(pending.id) !== lastChatPendingId) {
             lastChatPendingId = Number(pending.id)
@@ -803,12 +1210,35 @@ export function apply(ctx, rawConfig = {}) {
     } catch (error) {
       log.warn?.(`[heshen-pet] 取窗口侧凭据失败：${error?.message || String(error)}`)
     }
-    child = spawnPet(log, {
+    const childEnv = {
       HESHEN_DSHPET_ORIGIN: dshPet.origin,
       ...(token ? { HESHEN_DSHPET_TOKEN: token } : {}),
-    })
+    }
+    child = spawnPet(log, childEnv)
+    // 新装机器上 Electron 是 dsh-pet 第一次启动时才下载的：那时候这里还找不到可执行文件。
+    // 别就这么不管了——每 20 秒重试一次（最多 45 次 ≈ 15 分钟），下载完成自动起身。
+    let disposed = false
+    let retryTimer
+    let retries = 0
+    const retrySpawn = () => {
+      retryTimer = undefined
+      if (disposed || child) return
+      if (retries >= 45) {
+        log.warn?.('[heshen-pet] 等 Electron 超时（15 分钟）：设置 DSH_PET_ELECTRON_PATH 或先启动一次 dsh-pet')
+        return
+      }
+      retries++
+      child = spawnPet(log, childEnv)
+      if (!child) retryTimer = setTimeout(retrySpawn, 20000)
+    }
+    if (!child) {
+      retryTimer = setTimeout(retrySpawn, 20000)
+      retryTimer.unref?.()
+    }
     void writeState({ visible: true }).catch(() => {})
     return () => {
+      disposed = true
+      if (retryTimer) clearTimeout(retryTimer)
       try {
         child?.kill()
       } catch {}
@@ -879,7 +1309,8 @@ export function apply(ctx, rawConfig = {}) {
               const t = value.target || {}
               const pets = value.petState?.state?.pets
               const live = pets && typeof pets === 'object' ? pets : {}
-              const pos = Object.keys(live).join(',')
+              const pos =
+                Object.keys(live).join(',') || (t.pet?.id ? `${t.pet.id}（来自配置）` : '')
               text =
                 `大肥鱼：${t.ok ? (t.visible ? (t.surface === 'desktop' ? '在桌面窗口里' : '在网页里') : '不在显示范围') : `定位失败（${t.reason || '未知'}）`}\n` +
                 `框：${t.rect ? `${t.rect.x},${t.rect.y} ${t.rect.w}×${t.rect.h}` : '无'}\n` +
