@@ -60,7 +60,6 @@ const LOOPING_ANIMS = new Set([
   '待机-背手',
   '待机-打哈欠',
   '待机-数朝珠',
-  '工作-循环',
 ])
 
 const FACE_LINES = {
@@ -74,47 +73,55 @@ const FACE_LINES = {
   '08-困倦': '夜深了，奴才实在撑不住了……',
 }
 
+/** 表情的脸谱名，用和大人的口气叫出来 */
+const FACE_LABELS = {
+  '01-招牌笑': '招牌笑脸迎皇上',
+  '02-算计': '肚子里拨算盘',
+  '03-惊讶': '吓得一激灵',
+  '04-委屈': '委屈巴巴要掉泪',
+  '05-得意': '尾巴翘到天上',
+  '06-恼怒': '恼了，要骂人了',
+  '07-害怕': '腿肚子直转筋',
+  '08-困倦': '困得直点头',
+}
+
 const TREE = {
   rite: {
-    label: '礼仪动作',
+    label: '给皇上请安',
     items: [
-      { label: '行个礼', action: 'play', anim: '点击-拱手', text: '皇上圣明，奴才给您行礼了！' },
-      { label: '递古董', action: 'play', anim: '递古董', text: '皇上，这件青花瓷瓶，奴才特意给您寻来的。' },
-      { label: '跪舔', action: 'play', anim: '跪舔', text: '皇上万岁，奴才给您磕头了！' },
-      { label: '拍马屁', action: 'play', anim: '拍马屁', text: '皇上圣明！皇上说得太对了！' },
-      { label: '被参一本', action: 'play', anim: '被参一本', text: '皇上明鉴！奴才冤枉啊！' },
+      { label: '规规矩矩行个大礼', action: 'play', anim: '点击-拱手', text: '皇上圣明，奴才给您行礼了！' },
+      { label: '献件宝贝给皇上瞧', action: 'play', anim: '递古董', text: '皇上，这件青花瓷瓶，奴才特意给您寻来的。' },
+      { label: '趴下磕头表忠心', action: 'play', anim: '跪舔', text: '皇上万岁，奴才给您磕头了！' },
+      { label: '马屁拍到马蹄上', action: 'play', anim: '拍马屁', text: '皇上圣明！皇上说得太对了！' },
+      { label: '被参一本，奴才冤枉', action: 'play', anim: '被参一本', text: '皇上明鉴！奴才冤枉啊！' },
     ],
   },
   life: {
-    label: '日常金钱',
+    label: '奴才的钱袋子',
     items: [
-      { label: '琉璃厂', action: 'play', anim: '琉璃厂', text: '这件东西，才是真正的宝贝。' },
-      { label: '常服算账', action: 'play', anim: '常服算账', text: '这笔账，奴才得好好算算……' },
-      { label: '府里数银', action: 'play', anim: '府里数银', text: '这一堆银子，都是奴才给您攒的！' },
-      { label: '塞银票', action: 'play', anim: '塞银票', text: '这银票，奴才替您收着……' },
-      { label: '常服进门', action: 'play', anim: '常服进门', text: '小月姑娘！小月姑娘——' },
-      { label: '银票打手', action: 'play', anim: '银票打手', text: '我怎么就管不住这手呢！' },
-      { label: '斗嘴', action: 'play', anim: '斗嘴', text: '皇上，奴才这张嘴可不饶人！' },
+      { label: '逛琉璃厂淘宝贝', action: 'play', anim: '琉璃厂', text: '这件东西，才是真正的宝贝。' },
+      { label: '扒拉算盘算细账', action: 'play', anim: '常服算账', text: '这笔账，奴才得好好算算……' },
+      { label: '数银子数到手软', action: 'play', anim: '府里数银', text: '这一堆银子，都是奴才给您攒的！' },
+      { label: '袖子一抖塞银票', action: 'play', anim: '塞银票', text: '这银票，奴才替您收着……' },
+      { label: '常服回府喊小月', action: 'play', anim: '常服进门', text: '小月姑娘！小月姑娘——' },
+      { label: '手欠，自己打自己', action: 'play', anim: '银票打手', text: '我怎么就管不住这手呢！' },
+      { label: '跟老纪斗两句嘴', action: 'play', anim: '斗嘴', text: '皇上，奴才这张嘴可不饶人！' },
     ],
   },
   work: {
-    label: '工作待机',
+    label: '歇着的时候',
     items: [
-      { label: '掏出钞票（0-24）', action: 'play', anim: '工作-掏出', loop: false },
-      { label: '点钞循环（25-85）', action: 'play', anim: '工作-循环' },
-      { label: '点完收钞（86-95）', action: 'play', anim: '工作-收起', loop: false },
-      { label: '收钞→待机过渡', action: 'play', anim: '工作-过渡', loop: false },
-      { label: '呼吸待机', action: 'play', anim: '待机-呼吸' },
-      { label: '捻须待机', action: 'play', anim: '待机-捻须' },
-      { label: '背手待机', action: 'play', anim: '待机-背手' },
-      { label: '打哈欠待机', action: 'play', anim: '待机-打哈欠' },
-      { label: '数朝珠待机', action: 'play', anim: '待机-数朝珠' },
+      { label: '就这么喘口气', action: 'play', anim: '待机-呼吸' },
+      { label: '捻着胡子琢磨事', action: 'play', anim: '待机-捻须' },
+      { label: '背着手装深沉', action: 'play', anim: '待机-背手' },
+      { label: '张嘴打个大哈欠', action: 'play', anim: '待机-打哈欠' },
+      { label: '数朝珠解解闷', action: 'play', anim: '待机-数朝珠' },
     ],
   },
   face: {
-    label: '表情',
+    label: '变个脸给皇上看',
     items: Object.keys(FACE_LINES).map((face) => ({
-      label: face.slice(3),
+      label: FACE_LABELS[face] || face.slice(3),
       action: 'face',
       face,
       text: FACE_LINES[face],
@@ -165,17 +172,14 @@ function renderMain() {
   menu.appendChild(el('div', { className: 'muted', text: '和大人' }))
   // 大小 / 甩飞阈值 / 亏空阈值 这些设置项都搬去「DSH 设置 → 和大人府邸」了，菜单只留动作。
   menu.appendChild(
-    el('div', { className: 'muted', text: '设置：DSH 设置 → 和大人府邸' }),
+    el('div', { className: 'muted', text: '要调教奴才：DSH 设置 → 和大人府邸' }),
   )
 
   menu.appendChild(
-    el('button', { className: 'cat', text: '与和大人说话 ', onclick: () => act({ action: 'chat' }) }),
+    el('button', { className: 'cat', text: '跟奴才说两句 ', onclick: () => act({ action: 'chat' }) }),
   )
   menu.appendChild(
-    el('button', { className: 'cat', text: '查看国库 ', onclick: () => act({ action: 'treasury' }) }),
-  )
-  menu.appendChild(
-    el('button', { className: 'cat', text: '记忆账本 ', onclick: () => act({ action: 'memory' }) }),
+    el('button', { className: 'cat', text: '查询国库 ', onclick: () => act({ action: 'treasury' }) }),
   )
   menu.appendChild(el('div', { className: 'sep' }))
 
@@ -190,7 +194,7 @@ function renderMain() {
   }
 
   menu.appendChild(el('div', { className: 'sep' }))
-  const quit = el('button', { className: 'cat', text: '退出桌宠 ', onclick: () => act({ action: 'quit' }) })
+  const quit = el('button', { className: 'cat', text: '奴才告退 ', onclick: () => act({ action: 'quit' }) })
   quit.appendChild(el('span', { text: '›' }))
   menu.appendChild(quit)
   resizeToContent()

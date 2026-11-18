@@ -16,6 +16,21 @@ const os = require('node:os')
 const capture = require('./capture')
 const winprobe = require('./winprobe')
 
+/**
+ * 透明置顶窗被别的窗口整块盖住时，Chromium 会把这类窗口记为「被遮挡」并暂停合成，
+ * webp 动画/CSS 呼吸就停在最后一帧——表现就是「和大人不动了，点一下或开个菜单又活了」。
+ * 这几条开关把后台化/遮挡降频关掉，让它一直按正常帧率跑。
+ */
+for (const flag of [
+  'disable-backgrounding-occluded-windows',
+  'disable-renderer-backgrounding',
+  'disable-background-timer-throttling',
+]) {
+  try {
+    app.commandLine.appendSwitch(flag)
+  } catch {}
+}
+
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 const STATE_DIR = path.join(DSH_HOME, 'heshen-pet')
 const STATE_FILE = path.join(STATE_DIR, 'desktop-state.json')
@@ -88,6 +103,7 @@ let saveTimer = null
 let throwTimer = null
 let visibilityTimer = null
 let sayTimer = null
+let keepTopTimer = null
 let menuWatchdog = null
 let bubbleContentH = BUBBLE_H
 let fishTarget = null // state.dshpet：大肥鱼此刻的屏幕框（DIP）
@@ -1330,6 +1346,32 @@ function createWindow() {
   createChatWindow()
   setupTray()
   startStateWatcher()
+  keepPetOnTop()
+}
+
+/**
+ * 周期性把桌宠窗口重新顶到最上层。
+ *
+ * 症状：和大人还在动（渲染进程照常出帧、动画在跑），但鼠标点不到、拖不动——
+ * 因为别的置顶窗口（dsh-pet 那只 924×821 的透明 helper、各种 alwaysOnTop 播放器、
+ * 甚至另一个桌宠）被系统挪到了我们上面，点击全打在那个窗口上。
+ * 托盘右键/菜单里做一次动作之所以能"恢复"，就是因为那条路径调了 win.moveTop()。
+ * 这里每 4 秒自己顶一次；菜单/聊天窗开着时让它们保持在上面，不去抢。
+ */
+function keepPetOnTop() {
+  if (keepTopTimer) clearInterval(keepTopTimer)
+  keepTopTimer = setInterval(() => {
+    if (!win || win.isDestroyed() || !win.isVisible()) return
+    if (menuWin && !menuWin.isDestroyed() && menuWin.isVisible()) return
+    if (chatWin && !chatWin.isDestroyed() && chatWin.isVisible()) return
+    if (thresholdWin && !thresholdWin.isDestroyed() && thresholdWin.isVisible()) return
+    try {
+      if (!win.isAlwaysOnTop()) log('topmost lost -> reassert')
+      win.setAlwaysOnTop(true, 'screen-saver')
+      win.moveTop()
+    } catch {}
+  }, 4000)
+  keepTopTimer.unref?.()
 }
 
 /** 调试用：把每个窗口各截一张图后退出。 */
@@ -1592,6 +1634,7 @@ if (!gotLock) {
   app.on('will-quit', () => {
     if (visibilityTimer) clearInterval(visibilityTimer)
     if (sayTimer) clearTimeout(sayTimer)
+    if (keepTopTimer) clearInterval(keepTopTimer)
     stopCaptureDaemon('app quit')
     tray?.destroy()
   })

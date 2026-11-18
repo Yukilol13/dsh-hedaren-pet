@@ -99,7 +99,7 @@ const ANIM_FILES = {
   '待机-数朝珠': 'idle-shuzhu',
 }
 
-const CLICK_ANIMS = ['点击-拱手', '递古董', '跪舔', '银票打手', '斗嘴']
+const CLICK_ANIMS = ['点击-拱手', '递古董', '跪舔', '斗嘴']
 const CLICK_LINES = {
   '点击-拱手': '皇上圣明，奴才给您行礼了！',
   '递古董': '皇上，这件青花瓷瓶，奴才特意给您寻来的。',
@@ -197,17 +197,13 @@ function setMirror(on) {
 }
 
 /**
- * 随机照镜子：每 9–21 秒掷一次骰子，40% 概率翻/翻回来。
- * 工作中（state.work.active）不切换；动作本身不对称（网住/工作）也不翻。
+ * 镜像现在跟着「每个动作」走：待机小动作、可触发动画各掷一次 50%，
+ * 甩飞/捕鱼按飞行方向定，所以这里不再定时随机翻面。
+ * 保留这个函数只为了占位（调度器已停用）。
  */
 function scheduleMirror() {
   if (mirrorTimer) clearTimeout(mirrorTimer)
-  mirrorTimer = setTimeout(() => {
-    mirrorTimer = null
-    const working = Boolean(state.work && state.work.active)
-    if (!working && mirrorSafe() && Math.random() < 0.4) setMirror(!mirrored)
-    scheduleMirror()
-  }, 9000 + Math.random() * 12000)
+  mirrorTimer = null
 }
 
 /** 调试面板：实际窗口尺寸 vs 期望尺寸，用来查窗口是否贴合角色。 */
@@ -219,6 +215,62 @@ function animDuration(name) {
   const frames = Number(meta.frames)
   return Number.isFinite(frames) && frames > 0 ? frames * 33 + 40 : 1800
 }
+
+// ---- 被遮挡/切到后台之后回来：强制重播当前动画 ----
+// Chromium 在窗口被整块盖住时会暂停合成，webp/CSS 动画停在最后一帧，
+// 看起来就是「人卡住了」。可见性恢复时把动画重新拉起来，顺便留一条日志便于排查。
+document.addEventListener('visibilitychange', () => {
+  console.log(`visibility ${document.hidden ? 'hidden' : 'visible'} anim=${currentAnim}`)
+  if (document.hidden) return
+  const name = currentAnim
+  if (!name) return
+  // playAnim 同名的会直接 return，先清掉再播才能真的重启动画
+  currentAnim = ''
+  playAnim(name, true)
+  void animEl.offsetWidth
+})
+
+// ---- 画面自愈：合成器/动画卡住时自己把画面重新拉起来 ----
+// 症状：进程还活着、定时器还在跑（mirror 日志照出），但画面停在最后一帧，点一下/开个菜单又活了。
+// 这里用 requestAnimationFrame 当心跳：它在跑说明画面真在出帧；停了超过 3 秒就强制重播一次动画。
+let lastFrameAt = Date.now()
+function frameTick() {
+  lastFrameAt = Date.now()
+  requestAnimationFrame(frameTick)
+}
+requestAnimationFrame(frameTick)
+let selfHealAt = 0
+let lastNudgeAt = Date.now()
+setInterval(() => {
+  if (document.hidden) return
+  // 兜底：每 15 秒主动失效一次图层。DWM 偶尔会把透明置顶窗的最后一张画面留在屏幕上，
+  // 主动提交一帧能把它拉回来（代价只有一次重排）。
+  if (Date.now() - lastNudgeAt > 15000) {
+    lastNudgeAt = Date.now()
+    const prev = flipEl.style.transform
+    flipEl.style.transform = 'translateZ(0)'
+    void flipEl.offsetWidth
+    flipEl.style.transform = prev
+  }
+  // 诊断：正在拖但位移没发出去（rAF 被暂停那种情况会这样）
+  if (typeof drag !== 'undefined' && drag && drag.moved && Date.now() - lastMoveForwardAt > 1200) {
+    console.log(`drag stalled ${Date.now() - lastMoveForwardAt}ms hidden=${document.hidden} anim=${currentAnim}`)
+  }
+  const stalled = Date.now() - lastFrameAt
+  if (stalled < 3000) return
+  if (Date.now() - selfHealAt < 5000) return
+  selfHealAt = Date.now()
+  console.log(`frame stalled ${stalled}ms anim=${currentAnim} -> reseat`)
+  const name = currentAnim || IDLE
+  currentAnim = ''
+  playAnim(name, true)
+  // 强制失效一次图层，让合成器重新提交这一帧
+  const prev = animEl.style.transform
+  animEl.style.transform = 'translateZ(0)'
+  void animEl.offsetWidth
+  animEl.style.transform = prev
+  lastFrameAt = Date.now()
+}, 2000)
 
 function playAnim(name, loop = true) {
   const safe = String(name || IDLE).replace(/[\\/:*?"<>|]/g, '')
@@ -250,13 +302,31 @@ function playAnim(name, loop = true) {
   }
 }
 
-// ---- 待机循环：常服 / 官服 呼吸交替 + 定时随机播一个待机小动作 ----
-const IDLE_ACTIONS = ['待机-捻须', '待机-背手', '待机-打哈欠', '待机-数朝珠']
+// ---- 待机循环：常服 / 官服 呼吸交替 + 定时随机播一个动作 ----
+// 待机时 60% 播「待机类」小动作，40% 播一个「可触发动作」（含国库查询）；
+// 点钞相关的形象（点钞/工作-循环 …）只在工作状态出现，不进待机池。
+const IDLE_POSES = ['待机-捻须', '待机-背手', '待机-打哈欠', '待机-数朝珠']
+const TREASURY_ANIM = '府里数银'
+// 20% 那一档的门类：礼仪动作 / 日常金钱 / 表情 / 国库
+const RITE_ACTIONS = ['点击-拱手', '递古董', '跪舔', '拍马屁', '被参一本']
+const MONEY_ACTIONS = ['琉璃厂', '常服算账', '府里数银', '塞银票', '常服进门', '银票打手', '斗嘴']
+const FACE_IDLE = [
+  { face: '01-招牌笑', text: '皇上吉祥，奴才瞧着您心里就熨帖。' },
+  { face: '02-算计', text: '这笔账，奴才心里门儿清。' },
+  { face: '05-得意', text: '皇上您瞧瞧，奴才这差办得还算体面吧？' },
+  { face: '06-恼怒', text: '老纪那张嘴，又在背后编排奴才……' },
+  { face: '07-害怕', text: '皇上您这一眼，奴才腿肚子就转筋。' },
+  { face: '08-困倦', text: '唔……奴才听着呢，就是眼皮有点沉。' },
+]
 const OUTFITS = ['官服', '常服']
 let outfitIndex = location.hash === '#changfu' ? 1 : 0
 let idleActionTimer = null
 let outfitTimer = null
 let idleRestTimer = null
+// 触发动画（点击 / 国库查询 / 外部点播）临时压住工作与待机，播完再恢复
+let triggerUntil = 0
+let triggerName = ''
+let triggerTimer = null
 
 function idleBreathFile() {
   return OUTFITS[outfitIndex] === '常服' ? 'idle-changfu' : 'idle-static'
@@ -275,30 +345,141 @@ function scheduleOutfitSwap() {
   }, 24000 + Math.random() * 18000)
 }
 
-function scheduleIdleAction() {
+// 待机轮播的起点：开机 2 秒后开始摇第一个动作（之后每次播完自己接着摇）
+setTimeout(() => scheduleIdleAction(0), 2000)
+
+/**
+ * 待机轮播：50% 呼吸、30% 四个待机小动作之一、20% 礼仪/日常金钱/表情/国库 之一。
+ * 每次播完再按同一套规矩摇下一个（不是固定间隔硬切）。
+ */
+function scheduleIdleAction(delay = 1200) {
   if (idleActionTimer) clearTimeout(idleActionTimer)
-  idleActionTimer = setTimeout(() => {
-    idleActionTimer = null
-    if (state.work?.active || workPhase !== 'idle') {
-      scheduleIdleAction()
-      return
-    }
-    if (currentAnim !== IDLE_BREATH) {
-      scheduleIdleAction()
-      return
-    }
-    const name = pick(IDLE_ACTIONS)
-    playAnim(name, true)
+  idleActionTimer = setTimeout(idleTick, delay)
+}
+
+function idleTick() {
+  idleActionTimer = null
+  if (state.work?.active || workPhase !== 'idle' || moodLocked() || triggerActive() || throwFaceAt) {
+    scheduleIdleAction(1500)
+    return
+  }
+  // 还有别的动作在播：等它播完再来
+  if (currentAnim !== IDLE_BREATH) {
+    scheduleIdleAction(1200)
+    return
+  }
+  const roll = Math.random()
+  if (roll < 0.5) {
+    // 50%：就那么呼吸待着
+    playAnim(IDLE_BREATH, true)
+    scheduleIdleAction(5000 + Math.random() * 4500)
+    return
+  }
+  if (roll < 0.8) {
+    // 30%：四个待机小动作
+    playIdleAction(pick(IDLE_POSES), true)
+    return
+  }
+  // 20%：礼仪动作 / 日常金钱 / 表情 / 国库
+  playCategoryAction()
+}
+
+/** 20% 那一档：先摇门类，再摇具体一项 */
+function playCategoryAction() {
+  const cat = pick(['rite', 'money', 'face', 'treasury'])
+  if (cat === 'face') {
+    const f = pick(FACE_IDLE)
+    const ms = 3500 + Math.random() * 1500
+    if (mirrorSafe()) setMirror(Math.random() < 0.5)
+    playAnim(IDLE_BREATH, true)
+    void save({ say: { id: Date.now(), text: f.text, face: f.face } })
     if (idleRestTimer) clearTimeout(idleRestTimer)
     idleRestTimer = setTimeout(() => {
       idleRestTimer = null
-      if (!state.work?.active && currentAnim === name) returnToIdle()
-    }, 6000 + Math.random() * 4000)
-    scheduleIdleAction()
-  }, 14000 + Math.random() * 10000)
+      scheduleIdleAction(600)
+    }, ms)
+    return
+  }
+  const name =
+    cat === 'rite' ? pick(RITE_ACTIONS) : cat === 'money' ? pick(MONEY_ACTIONS) : TREASURY_ANIM
+  playIdleAction(name, false)
+}
+
+/** 待机里播一个动作：待机类 4~8 秒，其余 2.5~5 秒，播完接着轮到下一个 */
+function playIdleAction(name, isPose) {
+  const ms = isPose ? 4000 + Math.random() * 4000 : 2500 + Math.random() * 2500
+  // 待机动作与触发动画都有 50% 概率镜像；甩飞/捕鱼按飞行方向走，不在这里
+  if (mirrorSafe()) setMirror(Math.random() < 0.5)
+  playAnim(name, true)
+  if (name === TREASURY_ANIM) void queryTreasuryByHand()
+  if (idleRestTimer) clearTimeout(idleRestTimer)
+  idleRestTimer = setTimeout(() => {
+    idleRestTimer = null
+    if (state.work?.active || moodLocked() || triggerActive()) {
+      scheduleIdleAction(1500)
+      return
+    }
+    if (currentAnim === name) returnToIdle()
+    scheduleIdleAction(600)
+  }, ms)
+}
+
+/** 待机时顺手查一次国库：写 refreshAt，宿主那侧会查询并把余额念出来 */
+function queryTreasuryByHand() {
+  const base = state.treasury && typeof state.treasury === 'object' ? state.treasury : {}
+  return save({ treasury: { ...base, refreshAt: Date.now() } })
+}
+
+function triggerActive() {
+  return Date.now() < triggerUntil
+}
+
+/**
+ * 播放「触发动画」：优先级高于工作与待机，低于胆战心惊/心花怒放锁定、
+ * 捕捉（网住大肥鱼）与甩飞。播完自动回到工作动画（在干活）或呼吸待机。
+ */
+function playTrigger(name, opts = {}) {
+  if (!name) return
+  if (moodLocked() || throwFaceAt) return
+  const ms = Number(opts.ms) > 0 ? Number(opts.ms) : Math.max(900, animDuration(name))
+  triggerName = name
+  triggerUntil = Date.now() + ms
+  if (opts.mirror !== false && mirrorSafe()) setMirror(Math.random() < 0.5)
+  playAnim(name, true)
+  if (name === TREASURY_ANIM) void queryTreasuryByHand()
+  if (triggerTimer) clearTimeout(triggerTimer)
+  triggerTimer = setTimeout(() => {
+    triggerTimer = null
+    if (triggerName !== name) return
+    triggerName = ''
+    triggerUntil = 0
+    resumeAfterTrigger()
+  }, ms)
+}
+
+/** 触发动画播完：该干活就回工作循环，否则回待机 */
+function resumeAfterTrigger() {
+  if (moodLocked()) {
+    applyMoodLock()
+    return
+  }
+  if (state.work?.active) {
+    if (workPhase === 'working') playAnim('工作-循环', true)
+    else if (workPhase === 'idle' || workPhase === 'tail') startWorkAnim()
+    else playAnim('工作-循环', true)
+    return
+  }
+  returnToIdle()
 }
 
 function returnToIdle() {
+  if (triggerActive()) return // 触发动画还没播完，别抢
+  // 颤栗值端点状态优先：胆战心惊 / 心花怒放各有固定形象
+  if (moodLocked() && Date.now() < (moodUntil || Infinity)) {
+    applyMoodLock()
+    scheduleMoodEnd()
+    return
+  }
   if (Date.now() >= jailUntil && state.work?.active) {
     // 工作态也要换图：交给工作动画，别让调用方以为已经恢复
     if (workPhase === 'idle' || workPhase === 'tail') startWorkAnim()
@@ -321,6 +502,33 @@ function scheduleJailEnd() {
   jailEndTimer = setTimeout(() => {
     jailEndTimer = null
     if (currentAnim === JAIL_IDLE || currentAnim === JAIL_IDLE_LEFT) returnToIdle()
+  }, left)
+}
+
+// ---- 颤栗值端点状态：胆战心惊锁「被参一本」，心花怒放锁「待机-背手」 ----
+const DREAD_ANIM = '被参一本'
+const ELATED_ANIM = '待机-背手'
+let moodState = 'normal'
+let moodUntil = 0
+
+function moodLocked() {
+  return moodState === 'dread' || moodState === 'elated'
+}
+
+function applyMoodLock() {
+  if (moodState === 'dread') playAnim(DREAD_ANIM, true)
+  else if (moodState === 'elated') playAnim(ELATED_ANIM, true)
+}
+
+function scheduleMoodEnd() {
+  if (!moodLocked() || !moodUntil) return
+  const left = Math.max(300, moodUntil - Date.now() + 60)
+  setTimeout(() => {
+    if (moodLocked() && Date.now() >= moodUntil) {
+      moodState = 'normal'
+      moodUntil = 0
+      returnToIdle()
+    }
   }, left)
 }
 
@@ -398,10 +606,9 @@ function endWorkAnim() {
 function clickPet() {
   const animName = pick(CLICK_ANIMS)
   const line = CLICK_LINES[animName] || pick(LINES.click)
-  void save({
-    say: { id: Date.now(), text: line },
-    anim: { id: Date.now(), name: animName, loop: false },
-  })
+  // 本地立刻播（触发级优先级，能压住工作/待机），气泡交给宿主落盘
+  playTrigger(animName)
+  void save({ say: { id: Date.now(), text: line } })
 }
 
 async function save(patch) {
@@ -466,6 +673,24 @@ function applyState(next) {
   // 牢房待机（查国库发现亏空时触发）：期间用囚犯形象，工作/捕捉优先
   const jailAt = Number(state.jail?.until) || 0
   if (jailAt > jailUntil) jailUntil = jailAt
+
+  // 颤栗值端点状态（胆战心惊=被参一本 / 心花怒放=背手）：优先级在牢房之上
+  const moodNext = state.mood || {}
+  const moodName = moodNext.state === 'dread' || moodNext.state === 'elated' ? moodNext.state : 'normal'
+  const moodLeft = Number(moodNext.stateMsLeft) || 0
+  const moodChanged = moodName !== moodState
+  moodState = moodName
+  moodUntil = moodLeft > 0 ? Date.now() + moodLeft : 0
+  if (moodLocked()) {
+    if (state.work?.active) workPhase = 'idle'
+    if (moodChanged || currentAnim !== (moodName === 'dread' ? DREAD_ANIM : ELATED_ANIM)) {
+      applyMoodLock()
+      console.log(`mood lock ${moodName} anim=${currentAnim}`)
+    }
+    scheduleMoodEnd()
+    return // 锁形象期间不让工作/待机循环抢镜
+  }
+
   // 牢房是「查国库发现亏空」的戏剧时刻：哪怕正在干活也先演这一出，演完再回去干活
   if (jailUntil > Date.now()) {
     if (state.work?.active) workPhase = 'idle'
@@ -482,21 +707,15 @@ function applyState(next) {
     if (currentAnim) applyMeta(currentAnim)
   }
   if (state.work?.active) {
+    if (triggerActive()) return // 触发动画正压着，等它播完再回工作
     if (workPhase === 'idle' || workPhase === 'tail') startWorkAnim()
     else if (workPhase === 'working') {
-      // 工作中的点单：用户点的动作先播一遍，播完自动回到点钞循环
+      // 工作中的点单：用户点的动作按触发级播一遍，播完自动回到工作循环
       if (state.anim && state.anim.id !== lastAnimId) {
         lastAnimId = state.anim.id
         const name = state.anim.name || ''
-        if (name && name !== '工作-循环' && !name.startsWith('工作-')) {
-          userOverride = name
-          playAnim(name, state.anim.loop !== false)
-          if (animTimer) clearTimeout(animTimer)
-          animTimer = setTimeout(() => {
-            animTimer = null
-            userOverride = ''
-            if (workPhase === 'working' && state.work?.active) playAnim('工作-循环', true)
-          }, animDuration(name))
+        if (name && name !== '工作-循环' && !name.startsWith('工作-') && name !== '待机-呼吸') {
+          playTrigger(name)
           return
         }
       }
@@ -510,9 +729,17 @@ function applyState(next) {
   }
   // 收钞 → 过渡 → 待机，这两段不打断
   if (workPhase === 'end' || workPhase === 'tail') return
+  if (triggerActive()) return // 触发动画进行中，别让轮询抢镜
   if (state.anim && state.anim.id !== lastAnimId) {
     lastAnimId = state.anim.id
-    playAnim(state.anim.name || IDLE, state.anim.loop !== false)
+    const name = state.anim.name || IDLE
+    // 甩飞/捕鱼/牢房/待机类走各自通道，其余当作触发动画（50% 镜像 + 播完回待机）
+    const plain = name === IDLE || name.startsWith('待机-') || name.startsWith('工作-')
+    if (plain || name.startsWith('甩飞') || name.startsWith('网住大肥鱼')) {
+      playAnim(name, state.anim.loop !== false)
+    } else {
+      playTrigger(name)
+    }
   }
 }
 
@@ -552,16 +779,26 @@ window.addEventListener('mousedown', (e) => {
   }
   e.preventDefault()
 })
-// 每个动画帧最多向主进程发一次位移。
+// 每个「合并窗口」最多向主进程发一次位移。
 // Windows 高回报率鼠标一秒能发 125–1000 个 mousemove，每个都 IPC + 移动窗口
-// 会把主进程压满（拖拽卡顿的主因），这里合并成帧级增量。
+// 会把主进程压满（拖拽卡顿的主因），这里合并成批增量。
+//
+// 注意：**不能用 requestAnimationFrame 来合并**。rAF 在页面被判成「不可见/后台」时会被
+// Chromium 暂停，而拖动只依赖它——一停就表现为「和大人还在动，但鼠标怎么拖都不挪」，
+// 右键菜单、聊天都正常（那些走 IPC 不经 rAF）。定时器配合 backgroundThrottling:false
+// 不会停，所以这里用 setTimeout。
 let pendingMove = null
-let moveRaf = 0
+let moveTimer = 0
+let lastMoveForwardAt = 0
 function flushMove() {
-  moveRaf = 0
+  if (moveTimer) {
+    clearTimeout(moveTimer)
+    moveTimer = 0
+  }
   if (!pendingMove) return
   const { dx, dy } = pendingMove
   pendingMove = null
+  lastMoveForwardAt = Date.now()
   window.heshen.moveBy(dx, dy)
 }
 
@@ -580,7 +817,7 @@ window.addEventListener('mousemove', (e) => {
   pendingMove = pendingMove
     ? { dx: pendingMove.dx + dx, dy: pendingMove.dy + dy }
     : { dx, dy }
-  if (!moveRaf) moveRaf = requestAnimationFrame(flushMove)
+  if (!moveTimer) moveTimer = setTimeout(flushMove, 8)
 })
 
 /** 取松手前一个短窗口内的位移，换算成甩动速度和力度。 */
@@ -627,10 +864,6 @@ function stillMsBefore(trail, releaseT, settleMs) {
 
 window.addEventListener('mouseup', (e) => {
   if (!drag) return
-  if (moveRaf) {
-    cancelAnimationFrame(moveRaf)
-    moveRaf = 0
-  }
   flushMove()
   const wasMoved = drag.moved
   if (wasMoved) {

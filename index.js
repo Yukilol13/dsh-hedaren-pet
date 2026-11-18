@@ -15,6 +15,17 @@ import { fileURLToPath } from 'node:url'
 
 import { BUDGET, createMemoryStore, estimateTokens } from './memory.js'
 import { createDshPetBridge } from './dshpet.js'
+import {
+  RANK_MIN,
+  TREMBLE_INIT,
+  applyTurn,
+  classify,
+  createMoodState,
+  directiveFor,
+  forcedReply,
+  publicView,
+  rankLabel,
+} from './mood.js'
 
 export const name = 'heshen-desktop-pet'
 export const inject = ['commands', 'credentials', 'connection']
@@ -410,6 +421,7 @@ export function apply(ctx, rawConfig = {}) {
         assets: current.treasury?.assets ?? null,
         fish: treasury.fish || 0,
       },
+      mood: publicView(await loadMood()),
     }
   }
 
@@ -474,6 +486,9 @@ export function apply(ctx, rawConfig = {}) {
         if (Object.prototype.hasOwnProperty.call(body, 'jailThreshold')) {
           await writeJailThreshold(body.jailThreshold)
         }
+        if (Object.prototype.hasOwnProperty.call(body, 'resetMood')) {
+          await resetMood()
+        }
         if (Object.prototype.hasOwnProperty.call(body, 'chatModel')) {
           const id = String(body.chatModel || '').trim()
           const models = await listChatModels({ force: true })
@@ -502,8 +517,45 @@ export function apply(ctx, rawConfig = {}) {
       log.warn?.('[heshen-pet] 没有 webServer，设置页拿不到数据')
       return () => {}
     }
-    return ws.register({ kind: 'exact', path: '/heshen-pet/settings', handler: settingsHandler })
-  }, 'heshen-desktop-pet: 设置接口')
+    const offSettings = ws.register({ kind: 'exact', path: '/heshen-pet/settings', handler: settingsHandler })
+    const offDiary = ws.register({ kind: 'exact', path: '/heshen-pet/diary', handler: diaryHandler })
+    return () => {
+      offSettings?.()
+      offDiary?.()
+    }
+  }, 'heshen-desktop-pet: 设置与日记接口')
+
+  /**
+   * 和大人日记：GET 返回每份记忆文件（主记忆 + 每片分记忆）与统计；
+   * POST {burn:['main','情感1'…]} 焚毁整份文件。只能烧，不能改。
+   */
+  async function diaryHandler(req, res) {
+    try {
+      if (req.method === 'POST' || req.method === 'PUT') {
+        const body = await readJsonBody(req, 64 * 1024)
+        if (!body || !Array.isArray(body.burn)) {
+          sendJson(res, 400, { ok: false, message: '请求体需要 { burn: ["情感1"…] }' })
+          return
+        }
+        // 主记忆是奴才知道自己是谁的那本底账，不能烧
+        const wanted = body.burn.map(String).filter((name) => name && name !== 'main')
+        if (!wanted.length) {
+          sendJson(res, 400, { ok: false, message: '主记忆这本底账不能烧，皇上要烧请挑分散的册子。' })
+          return
+        }
+        const result = await memoryStore.burn(wanted)
+        log.info?.(`[heshen-pet] 焚毁日记 ${result.burned.length} 份（${result.burned.join('、') || '无'}），还剩 ${result.left} 份`)
+        const after = await memoryStore.diary()
+        sendJson(res, 200, { ok: true, burned: result, diary: after })
+        return
+      }
+      const data = await memoryStore.diary()
+      sendJson(res, 200, { ok: true, diary: data })
+    } catch (error) {
+      log.warn?.(`[heshen-pet] 日记接口失败：${error?.message || String(error)}`)
+      sendJson(res, 500, { ok: false, message: error?.message || String(error) })
+    }
+  }
 
   // ---------- 国库 / 和大人资产 ----------
   const treasuryFile = join(dshHome(), 'heshen-pet', 'desktop-treasury.json')
@@ -560,6 +612,11 @@ export function apply(ctx, rawConfig = {}) {
       await writeFile(treasuryFile, JSON.stringify(treasury, null, 2), 'utf8')
     } catch {}
   }
+
+  // ---------- 网住大肥鱼以后的退回入口 ----------
+  // 关掉她（display=none）是不可逆的：dsh-pet 的 display 只有托盘 / 网页设置能改回来。
+  // 所以这里不自动放回（捕获是彩蛋，用户要她一直关着），只保证退回入口还在：
+  // 托盘补丁见 scripts/patch-dsh-pet-tray.mjs（重启 DSH 后托盘不消失）。
 
   /**
    * 窗口那侧把「撞上大肥鱼」的判定结果写进 state.fish，这里做后果：
@@ -852,6 +909,58 @@ export function apply(ctx, rawConfig = {}) {
   const MEMORY_HINT =
     '以上是你的记忆（画像、目录、命中的分记忆）。用得上就自然带一句「奴才记得……」，用不上别硬提；记忆里没有的事，别编。'
 
+  // ---------- 颤栗值 / 官位（和大人府邸里能看，也能重置） ----------
+  const moodFile = join(dshHome(), 'heshen-pet', 'mood.json')
+
+  /** 胆战心惊状态下的固定话术：认错 + 求饶，不走模型也不弹气泡 */
+  const DREAD_LINES = [
+    '（趴在地上直哆嗦）奴才该死！奴才该死！求皇上开恩，饶奴才这条狗命……',
+    '（声音打颤）皇上息怒，都是奴才的错，奴才再也不敢了，求皇上宽恕……',
+    '（连连磕头）奴才认罪，奴才万死，只求皇上开恩，别把奴才赶出去……',
+  ]
+
+  let moodCache = null
+  let lastAnsweredPendingId = 0
+
+  async function loadMood() {
+    if (moodCache) return moodCache
+    try {
+      moodCache = createMoodState(JSON.parse(await readFile(moodFile, 'utf8')))
+    } catch {
+      moodCache = createMoodState({})
+    }
+    return moodCache
+  }
+
+  /**
+   * 存颤栗值，并把当前状态写进 state 给窗口/设置页用。
+   * animate=true 时才去动 anim：进入/解除端点状态那一刻换形象，平时别打断正在播的动画。
+   */
+  async function saveMood(next, { animate = false } = {}) {
+    moodCache = createMoodState(next)
+    try {
+      await mkdir(dirname(moodFile), { recursive: true })
+      await writeFile(moodFile, JSON.stringify(moodCache, null, 2), 'utf8')
+    } catch (error) {
+      log.warn?.(`[heshen-pet] 保存颤栗值失败：${error?.message || String(error)}`)
+    }
+    const view = publicView(moodCache)
+    await writeState({ mood: view })
+    if (animate) {
+      const name = view.state === 'dread' ? '被参一本' : view.state === 'elated' ? '待机-背手' : IDLE
+      await writeState({ anim: { id: Date.now(), name, loop: true } })
+    }
+    return moodCache
+  }
+
+  /** 重置：颤栗值回 5，官位回一品，两个状态清掉 */
+  async function resetMood() {
+    moodCache = createMoodState({})
+    await saveMood(moodCache, { animate: true })
+    log.info?.('[heshen-pet] 颤栗值/官位已重置')
+    return moodCache
+  }
+
   // ---------- 对话模型：列出 DSH 里已经配置好的模型，允许挑一个 ----------
   const CHAT_MODEL_FILE = () => join(dshHome(), 'heshen-pet', 'chat-model.json')
   let chatModelsCache = { at: 0, list: [], selection: null }
@@ -1028,6 +1137,28 @@ export function apply(ctx, rawConfig = {}) {
   async function answerChat(current, pending) {
     const text = String(pending?.text ?? '').trim()
     if (!text) return
+    // 幂等：工具直调 answerChat 时，轮询线程也可能捡到同一条 pending，
+    // 那样一句话会被处理两遍（颤栗值涨双份、官位降两格）。这里按 pending id 去重。
+    const pid = Number(pending?.id) || 0
+    if (pid && pid === lastAnsweredPendingId) {
+      log.info?.(`[heshen-pet] 跳过重复处理（pending ${pid}）`)
+      return
+    }
+    if (pid) lastAnsweredPendingId = pid
+    // ---- 颤栗值 / 官位：先把这一句话的影响算进去 ----
+    const moodBefore = await loadMood()
+    const trembleBefore = moodBefore.tremble
+    const cls = classify(text)
+    const applied = applyTurn(moodBefore, cls)
+    const moodAfter = await saveMood(applied.state, { animate: Boolean(applied.entered || applied.released) })
+    if (applied.entered) log.info?.(`[heshen-pet] 进入「${applied.entered}」状态（颤栗值 ${applied.before} → ${applied.after}）`)
+    if (applied.released) log.info?.(`[heshen-pet] 解除「${applied.released}」状态（颤栗值回到 ${applied.after}）`)
+    if (cls.rank) log.info?.(`[heshen-pet] 官位指令 ${cls.rank.dir}/${cls.rank.n} → ${rankLabel(moodAfter.rank)}`)
+    log.info?.(
+      `[heshen-pet] 颤栗值 ${trembleBefore} → ${applied.after}（${moodAfter.state}，${rankLabel(moodAfter.rank)}，` +
+        `判定=${cls.kind}${cls.severe ? '/严厉' : ''}${cls.bounty ? '/厚赏' : ''}）`,
+    )
+
     const persona = await loadPersona()
     const personaTokens = estimateTokens(persona)
     let injected = { text: '', picked: [], used: { profile: 0, main: 0, catalog: 0, shard: 0 } }
@@ -1036,20 +1167,29 @@ export function apply(ctx, rawConfig = {}) {
     } catch (error) {
       log.warn?.(`[heshen-pet] 记忆检索失败：${error?.message || String(error)}`)
     }
-    const system = [persona, injected.text, MEMORY_HINT].filter(Boolean).join('\n\n')
+    const moodDir = directiveFor(moodAfter, cls, trembleBefore)
+    const system = [persona, injected.text, MEMORY_HINT, moodDir].filter(Boolean).join('\n\n')
     const { messages: historyMessages, tokens: historyTokens } = memoryStore.historyForPrompt()
 
     let reply
-    try {
-      reply = await callChat(
-        [{ role: 'system', content: system }, ...historyMessages, { role: 'user', content: text }],
-        BUDGET.replyMaxTokens,
-      )
-    } catch (error) {
-      log.warn?.(`[heshen-pet] 对话失败：${error?.message || String(error)}`)
-      reply = '（拱手）奴才这会儿脑子有点发木，皇上您再说一遍？'
+    if (moodAfter.state === 'dread') {
+      // 胆战心惊：不管皇上说什么都是认错求饶，用固定话术兜住，别让模型自由发挥
+      reply = pick(DREAD_LINES)
+      log.info?.(`[heshen-pet] 胆战心惊状态下回话（不走模型，也不弹气泡）`)
+    } else {
+      try {
+        reply = await callChat(
+          [{ role: 'system', content: system }, ...historyMessages, { role: 'user', content: text }],
+          BUDGET.replyMaxTokens,
+        )
+      } catch (error) {
+        log.warn?.(`[heshen-pet] 对话失败：${error?.message || String(error)}`)
+        reply = '（拱手）奴才这会儿脑子有点发木，皇上您再说一遍？'
+      }
     }
     if (!reply) reply = '（陪笑）奴才听着呢，皇上您尽管吩咐。'
+    const forced = forcedReply(moodAfter)
+    if (forced.length) reply = `${forced.join('')}${reply}`
 
     // 先记下来再回话：分类 → 小量进主记忆，量大了进分记忆
     let remembered = null
@@ -1080,7 +1220,10 @@ export function apply(ctx, rawConfig = {}) {
       { id: Date.now(), role: 'assistant', text: reply, at: Date.now() },
     ]
     await writeState({ chat: { ...(current.chat || {}), open: true, messages, pending: null } })
-    await say(reply.length > 60 ? reply.slice(0, 58) + '…' : reply)
+    // 胆战心惊状态下不触发聊天泡泡（要求：只保持「被参一本」形象，不出气泡）
+    if (moodAfter.state !== 'dread') {
+      await say(reply.length > 60 ? reply.slice(0, 58) + '…' : reply)
+    }
   }
 
   /** 记忆账本：写进聊天窗，顺便开窗 */
@@ -1236,6 +1379,10 @@ export function apply(ctx, rawConfig = {}) {
       retryTimer.unref?.()
     }
     void writeState({ visible: true }).catch(() => {})
+    // 启动时把颤栗值/官位同步一次，设置页不用等第一句对话就有数
+    void loadMood()
+      .then((moodState) => writeState({ mood: publicView(moodState) }))
+      .catch(() => {})
     return () => {
       disposed = true
       if (retryTimer) clearTimeout(retryTimer)
@@ -1266,15 +1413,15 @@ export function apply(ctx, rawConfig = {}) {
     return tools.register({
       name: 'heshen_pet',
       description:
-        '控制和大人独立桌宠：让他说话、播放指定动作、显示或隐藏、模拟工作状态。动作名例如「待机-呼吸」「待机-牢房」「待机-捻须」「点击-拱手」「银票打手」「斗嘴」「递古董」「常服进门」「琉璃厂」「跪舔」「常服算账」「塞银票」「拍马屁」「被参一本」「府里数银」「工作-掏出」「工作-循环」「工作-收起」「工作-过渡」「甩飞」「网住大肥鱼」。',
+        '控制和大人独立桌宠：让他说话、播放指定动作、显示或隐藏、模拟工作状态、查看颤栗值与官位。动作名例如「待机-呼吸」「待机-牢房」「待机-捻须」「点击-拱手」「银票打手」「斗嘴」「递古董」「常服进门」「琉璃厂」「跪舔」「常服算账」「塞银票」「拍马屁」「被参一本」「府里数银」「工作-掏出」「工作-循环」「工作-收起」「工作-过渡」「甩飞」「网住大肥鱼」。',
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
-            enum: ['status', 'say', 'play', 'show', 'hide', 'work', 'treasury', 'chat', 'memory', 'memory_search', 'fish', 'fish_hide', 'fish_show'],
+            enum: ['status', 'say', 'play', 'show', 'hide', 'work', 'treasury', 'chat', 'memory', 'memory_search', 'fish', 'fish_hide', 'fish_show', 'mood', 'mood_reset'],
             description:
-              'status 查状态；say 说一句；play 播动作；show/hide 显示隐藏；work 模拟/清除工作状态；treasury 查国库；chat 以皇上身份和和大人说一句；memory 看记忆账本；memory_search 按 query 试检索记忆；fish 看大肥鱼定位与最近一次捕捉；fish_hide/fish_show 关闭或恢复大肥鱼（调试用）。',
+              'status 查状态；say 说一句；play 播动作；show/hide 显示隐藏；work 模拟/清除工作状态；treasury 查国库；chat 以皇上身份和和大人说一句；mood 查颤栗值与官位；mood_reset 重置颤栗值与官位；memory_search 按 query 试检索记忆；fish 看大肥鱼定位与最近一次捕捉；fish_hide/fish_show 关闭或恢复大肥鱼（调试用）。和大人日记（统计/焚毁）在 DSH 设置 → 和大人府邸。',
           },
           text: { type: 'string', description: 'action=say 时的台词。' },
           query: { type: 'string', description: 'action=memory_search 时：要检索的问题，例如「我追的姑娘不理我」。' },
@@ -1332,6 +1479,16 @@ export function apply(ctx, rawConfig = {}) {
                 `已网住：${value.treasuryFish || 0} 条`
             } else if (action === 'fish_hide' || action === 'fish_show') {
               text = `${action === 'fish_hide' ? '关闭' : '恢复'}大肥鱼：${value.ok ? '成功' : '失败'}`
+            } else if (action === 'mood' || action === 'mood_reset') {
+              const m = value.mood || {}
+              const left =
+                m.state === 'normal'
+                  ? ''
+                  : `（${m.stateTurnsLeft} 轮 / ${Math.ceil((m.stateMsLeft || 0) / 1000)} 秒后解除）`
+              text =
+                `颤栗值：${m.trembleLabel ?? '?'} / 10 ｜ ${m.stateLabel || '平常'}${left}\n` +
+                `官位：${m.rankLabel || '?'}\n` +
+                `语气档：${m.band || '?'}`
             } else {
               text = `和大人：${value.anim?.name || '待机'}${value.say?.text ? ` · “${value.say.text}”` : ''}`
             }
@@ -1423,6 +1580,14 @@ export function apply(ctx, rawConfig = {}) {
             const result = await dshPet.show('both')
             await refreshFishTarget({ force: true })
             return { ok: Boolean(result.ok), show: result }
+          }
+          if (action === 'mood') {
+            const mood = publicView(await loadMood())
+            return { ok: true, mood }
+          }
+          if (action === 'mood_reset') {
+            const next = await resetMood()
+            return { ok: true, mood: publicView(next) }
           }
           if (action === 'show' || action === 'hide') {
             const next = await writeState({ visible: action === 'show' })

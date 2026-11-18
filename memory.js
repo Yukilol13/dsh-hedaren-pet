@@ -13,7 +13,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 export const CATS = ['情感', '情绪', '工作', '学习', '管理', '其他']
@@ -637,6 +637,116 @@ export function createMemoryStore({ root, log = console } = {}) {
     }
   }
 
+  // ---------- 和大人日记：一份记忆文件算一篇，只能焚毁、不能改写 ----------
+
+  async function sizeOf(file) {
+    try {
+      return (await stat(file)).size
+    } catch {
+      return 0
+    }
+  }
+
+  /**
+   * 日记库 = 每份形成记忆的文件各算一篇：主记忆一份 + 每片分记忆一份。
+   * 返回 { stats, files:[{ id, name, cat, file, bytes, items, tokens, updatedAt, preview[] }] }
+   */
+  async function diaryFiles() {
+    await load()
+    const mainLines = [
+      ...data.profile.map((p) => `画像：${String(p || '')}`),
+      ...data.items.map((item) => itemLine(item)),
+    ]
+    const files = [
+      {
+        id: 'main',
+        name: '主记忆',
+        cat: '主账',
+        file: 'main.json',
+        burnable: false,
+        bytes: await sizeOf(mainFile),
+        items: data.items.length,
+        profile: data.profile.length,
+        tokens: mainTokens(),
+        updatedAt: Number(data.updatedAt) || 0,
+        preview: [
+          ...data.profile.slice(-2).map((p) => `画像：${clip(p, 60)}`),
+          ...data.items.slice(-3).map((item) => itemLine(item)),
+        ],
+        lines: mainLines.slice(-120),
+      },
+    ]
+    for (const entry of data.catalog) {
+      const shard = await loadShard(entry.name)
+      if (!shard) continue
+      files.push({
+        id: shard.name,
+        name: shard.name,
+        cat: shard.cat,
+        file: `shards/${shard.name}.json`,
+        burnable: true,
+        bytes: await sizeOf(join(shardDir, `${shard.name}.json`)),
+        items: shard.items.length,
+        tokens: Number(shard.tokens) || 0,
+        createdAt: Number(shard.createdAt) || 0,
+        updatedAt: Number(shard.updatedAt) || 0,
+        preview: shard.items.slice(-3).map((item) => itemLine(item)),
+        lines: shard.items.slice(-200).map((item) => itemLine(item)),
+      })
+    }
+    const byCat = {}
+    for (const f of files) byCat[f.cat] = (byCat[f.cat] || 0) + 1
+    const summary = {
+      files: files.length,
+      entries: files.reduce((n, f) => n + (Number(f.items) || 0), 0),
+      tokens: files.reduce((n, f) => n + (Number(f.tokens) || 0), 0),
+      bytes: files.reduce((n, f) => n + (Number(f.bytes) || 0), 0),
+      byCat,
+      profile: data.profile.length,
+      turns: Number(stats.totalTurns) || 0,
+      newestAt: files.reduce((m, f) => Math.max(m, Number(f.updatedAt) || 0), 0),
+    }
+    return { stats: summary, files }
+  }
+
+  /**
+   * 焚毁整份日记文件。毛笔账本的规矩：不改写、不涂改，烧掉就是烧掉。
+   * - 分记忆：删文件 + 从目录摘除
+   * - 主记忆：清空画像与旧事（保留分记忆目录，不然分记忆文件会变成没人认领的孤儿）
+   */
+  async function burnFiles(names = []) {
+    const wanted = new Set(
+      (Array.isArray(names) ? names : []).map(String).filter((name) => name && name !== 'main'),
+    )
+    if (!wanted.size) return { burned: [], left: 0 }
+    return lock(async () => {
+      await load()
+      const burned = []
+      if (wanted.has('main')) {
+        data.profile = []
+        data.items = []
+        data.updatedAt = Date.now()
+        await saveMain()
+        burned.push('main')
+      }
+      let catalogChanged = false
+      for (const name of [...wanted]) {
+        if (name === 'main') continue
+        if (!data.catalog.some((x) => x.name === name)) continue
+        try {
+          await rm(join(shardDir, `${name}.json`), { force: true })
+        } catch {}
+        shardCache.delete(name)
+        data.catalog = data.catalog.filter((x) => x.name !== name)
+        catalogChanged = true
+        burned.push(name)
+      }
+      if (catalogChanged) await saveMain()
+      const after = await diaryFiles()
+      return { burned, left: after.stats.files }
+    })
+  }
+
   return {
     baseDir,
     memoryDir,
@@ -649,6 +759,8 @@ export function createMemoryStore({ root, log = console } = {}) {
     historyForPrompt,
     ledger,
     snapshot,
+    diary: diaryFiles,
+    burn: burnFiles,
     classify,
     estimateTokens,
   }

@@ -37,6 +37,15 @@ window.__ModuleLoader__.load({
       minWidth: '0',
     }
     const title = { fontSize: '15px', fontWeight: 600, margin: 0 }
+    const miniBtn = {
+      background: 'rgba(127,127,127,.14)',
+      color: 'inherit',
+      border: '1px solid rgba(127,127,127,.3)',
+      borderRadius: '8px',
+      padding: '3px 10px',
+      fontSize: '12px',
+      cursor: 'pointer',
+    }
 
     async function call(patch) {
       const res = await fetch('/heshen-pet/settings', {
@@ -57,9 +66,25 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState('')
       const [saved, setSaved] = React.useState('')
 
+      const [diary, setDiary] = React.useState(null)
+      const [picked, setPicked] = React.useState([])
+      const [burnNote, setBurnNote] = React.useState('')
+      const [expanded, setExpanded] = React.useState([])
+
       const apply = React.useCallback((payload) => {
         if (payload && payload.ok && payload.settings) setData(payload.settings)
         else setError((payload && payload.message) || '设置读不出来')
+      }, [])
+
+      const loadDiary = React.useCallback(async () => {
+        try {
+          const res = await fetch('/heshen-pet/diary', { credentials: 'same-origin', cache: 'no-store' })
+          const payload = await res.json()
+          if (payload && payload.ok) setDiary(payload.diary)
+          else setError((payload && payload.message) || '日记读不出来')
+        } catch (err) {
+          setError(String((err && err.message) || err))
+        }
       }, [])
 
       React.useEffect(() => {
@@ -71,10 +96,11 @@ window.__ModuleLoader__.load({
           .catch((err) => {
             if (alive) setError(String((err && err.message) || err))
           })
+        void loadDiary()
         return () => {
           alive = false
         }
-      }, [apply])
+      }, [apply, loadDiary])
 
       const save = React.useCallback(
         async (patch, note) => {
@@ -99,11 +125,282 @@ window.__ModuleLoader__.load({
       const balance = data.balance || {}
       const sources = Array.isArray(balance.sources) ? balance.sources : []
 
+      const formatAt = (ms) => {
+        const t = Number(ms)
+        if (!t) return '—'
+        const d = new Date(t)
+        const pad = (n) => String(n).padStart(2, '0')
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+      }
+
+      const burnPicked = async () => {
+        if (!picked.length) return
+        const ok =
+          typeof window === 'undefined' || typeof window.confirm !== 'function'
+            ? true
+            : window.confirm(`烧了这 ${picked.length} 本？火一过可就没了，奴才不能给您再造一本。`)
+        if (!ok) return
+        setBurnNote('')
+        try {
+          const res = await fetch('/heshen-pet/diary', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ burn: picked }),
+          })
+          const payload = await res.json()
+          if (payload && payload.ok) {
+            setDiary(payload.diary)
+            setBurnNote(`烧了 ${(payload.burned?.burned || []).length} 本，架上还剩 ${payload.burned?.left ?? '?'} 本`)
+            setPicked([])
+          } else {
+            setError((payload && payload.message) || '焚毁失败')
+          }
+        } catch (err) {
+          setError(String((err && err.message) || err))
+        }
+      }
+
+      const diaryStats = diary && diary.stats ? diary.stats : null
+      const diaryFiles = diary && Array.isArray(diary.files) ? diary.files : []
+      const diaryMain = diaryFiles.find((f) => f.id === 'main') || null
+      const diaryShards = diaryFiles.filter((f) => f.id !== 'main')
+
+      const toggleExpand = (id) =>
+        setExpanded((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
+
+      const diaryBlock = h(
+        'div',
+        { style: card },
+        h(
+          'div',
+          { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '10px', flexWrap: 'wrap' } },
+          h('span', { style: { fontSize: '15px', fontWeight: 600 } }, '和大人日记'),
+          h('span', { style: hint }, '奴才行文誊在纸上，一笔一笔的，改不得；瞧着碍眼的，只能点了火'),
+        ),
+        !diaryStats
+          ? h('p', { style: hint }, '奴才正翻箱倒柜找账本……')
+          : h(
+              'div',
+              { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
+              h(
+                'div',
+                { style: { display: 'flex', gap: '14px', flexWrap: 'wrap', ...hint } },
+                h('span', null, `拢共 ${diaryStats.files} 本册子`),
+                h('span', null, `${diaryStats.entries} 笔旧账`),
+                h('span', null, `约 ${diaryStats.tokens} tokens 的墨`),
+                h('span', null, `纸重 ${Math.round((diaryStats.bytes || 0) / 102.4) / 10} KB`),
+                h(
+                  'span',
+                  null,
+                  Object.entries(diaryStats.byCat || {})
+                    .map(([cat, n]) => `${cat} ${n} 本`)
+                    .join(' · ') || '还没分门类',
+                ),
+                h('span', null, `最近一笔 ${formatAt(diaryStats.newestAt)}`),
+              ),
+              h(
+                'div',
+                { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    style: { ...miniBtn, opacity: diaryShards.length ? 1 : 0.45 },
+                    disabled: !diaryShards.length,
+                    onClick: () => setPicked(diaryShards.map((f) => f.id)),
+                  },
+                  '全勾上',
+                ),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    style: { ...miniBtn, opacity: picked.length ? 1 : 0.45 },
+                    disabled: !picked.length,
+                    onClick: () => setPicked([]),
+                  },
+                  '都不勾',
+                ),
+                h('span', { style: hint }, `勾了 ${picked.length} 本`),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    style: {
+                      ...miniBtn,
+                      borderColor: picked.length ? 'rgba(220,90,70,.75)' : 'rgba(127,127,127,.3)',
+                      color: picked.length ? '#ff9a8a' : 'inherit',
+                      opacity: picked.length ? 1 : 0.45,
+                    },
+                    disabled: !picked.length,
+                    onClick: () => void burnPicked(),
+                  },
+                  '烧了这几本',
+                ),
+                burnNote ? h('span', { style: hint }, burnNote) : null,
+              ),
+              // 主账单独在上：只能翻开看，不能烧
+              diaryMain
+                ? h(
+                    'div',
+                    {
+                      style: {
+                        border: '1px solid rgba(127,127,127,.3)',
+                        borderRadius: '9px',
+                        padding: '9px 11px',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '6px',
+                      },
+                    },
+                    h(
+                      'div',
+                      { style: { display: 'flex', justifyContent: 'space-between', gap: '8px', alignItems: 'baseline' } },
+                      h('span', { style: { fontSize: '13.5px', fontWeight: 600 } }, '主账 · 奴才的底细'),
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          style: miniBtn,
+                          onClick: () => toggleExpand('main'),
+                        },
+                        expanded.includes('main') ? '收起来' : '翻开看',
+                      ),
+                    ),
+                    h(
+                      'span',
+                      { style: hint },
+                      `${diaryMain.profile} 条画像 · ${diaryMain.items} 笔旧事 · ${diaryMain.tokens} tokens · 这本是奴才认出皇上、记得自己是谁的底账，烧不得`,
+                    ),
+                    h(
+                      'div',
+                      {
+                        style: {
+                          display: expanded.includes('main') ? 'flex' : 'none',
+                          flexDirection: 'column',
+                          gap: '3px',
+                          maxHeight: '240px',
+                          overflowY: 'auto',
+                          fontSize: '12px',
+                          lineHeight: 1.6,
+                          whiteSpace: 'pre-wrap',
+                          opacity: 0.9,
+                        },
+                      },
+                      (diaryMain.lines || []).length
+                        ? (diaryMain.lines || []).join('\n')
+                        : '底账还空着，皇上多问几句，奴才才有的记。',
+                    ),
+                  )
+                : null,
+              diaryShards.length
+                ? h(
+                    'div',
+                    {
+                      style: {
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fill, minmax(212px, 1fr))',
+                        gap: '8px',
+                        maxHeight: '420px',
+                        overflowY: 'auto',
+                        paddingRight: '4px',
+                      },
+                    },
+                    ...diaryShards.map((file) => {
+                      const on = picked.includes(file.id)
+                      const open = expanded.includes(file.id)
+                      return h(
+                        'div',
+                        {
+                          key: file.id,
+                          style: {
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '5px',
+                            borderRadius: '9px',
+                            padding: '9px 10px',
+                            border: `1px solid ${on ? 'rgba(212,175,55,.8)' : 'rgba(127,127,127,.26)'}`,
+                            background: on ? 'rgba(212,175,55,.16)' : 'transparent',
+                          },
+                        },
+                        h(
+                          'div',
+                          { style: { display: 'flex', justifyContent: 'space-between', gap: '6px', alignItems: 'baseline' } },
+                          h(
+                            'button',
+                            {
+                              type: 'button',
+                              onClick: () =>
+                                setPicked((prev) =>
+                                  prev.includes(file.id) ? prev.filter((x) => x !== file.id) : [...prev, file.id],
+                                ),
+                              title: on ? '点一下就不勾了' : '点一下勾上，等着烧',
+                              style: {
+                                background: 'transparent',
+                                border: 0,
+                                color: 'inherit',
+                                font: 'inherit',
+                                cursor: 'pointer',
+                                padding: 0,
+                                textAlign: 'left',
+                              },
+                            },
+                            h('span', { style: { fontSize: '13.5px', fontWeight: 600 } }, `${on ? '☑ ' : '☐ '}${file.name}`),
+                          ),
+                          h('span', { style: hint }, file.cat),
+                        ),
+                        h(
+                          'span',
+                          { style: hint },
+                          `${file.items} 笔 · ${file.tokens} tokens · 纸重 ${Math.round((file.bytes || 0) / 102.4) / 10} KB`,
+                        ),
+                        h('span', { style: hint }, `末笔 ${formatAt(file.updatedAt)}`),
+                        h(
+                          'div',
+                          {
+                            style: {
+                              fontSize: '12px',
+                              lineHeight: 1.5,
+                              display: '-webkit-box',
+                              WebkitLineClamp: open ? 'unset' : 3,
+                              WebkitBoxOrient: 'vertical',
+                              overflow: 'hidden',
+                              whiteSpace: 'pre-wrap',
+                              opacity: 0.88,
+                              maxHeight: open ? '220px' : undefined,
+                              overflowY: open ? 'auto' : 'hidden',
+                            },
+                          },
+                          (file.lines && file.lines.length ? file.lines : file.preview || []).join('\n') ||
+                            '这本还没落下字。',
+                        ),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            style: { ...miniBtn, alignSelf: 'flex-start', padding: '2px 9px' },
+                            onClick: () => toggleExpand(file.id),
+                          },
+                          open ? '收起来' : '展开全文',
+                        ),
+                      )
+                    }),
+                  )
+                : h('p', { style: hint }, '散账还没誊——皇上多跟奴才说几句，奴才才有得记。'),
+            ),
+        h(
+          'p',
+          { style: hint },
+          '奴才的规矩：纸上落笔就不涂改，抄错了宁可重抄；皇上瞧不过眼的，点了火整本烧了便是——只是主账那本烧不得，烧了奴才可就记不得您了。',
+        ),
+      )
+
       return h(
         'div',
         { style: box },
         h('h3', { style: title }, '和大人府邸'),
-        h('p', { style: hint }, '和珅的桌面宠物：显示开关、甩飞手感、亏空阈值、聊天用哪个模型，都在这一页调。'),
+        h('p', { style: hint }, '奴才的府上：皇上要奴才见人还是躲着、个头多高、甩得多远、亏空多少就把奴才关进牢房、跟您说话使哪个脑子——都在这儿吩咐。'),
 
         h(
           'div',
@@ -116,7 +413,7 @@ window.__ModuleLoader__.load({
               checked: Boolean(data.visible),
               onChange: (e) => void save({ visible: e.target.checked }, e.target.checked ? '已叫回和大人' : '已把和大人收起来'),
             }),
-            h('span', { style: hint }, data.visible ? '此刻在桌面上' : '此刻隐藏着'),
+            h('span', { style: hint }, data.visible ? '奴才这会儿就在皇上桌面上候着' : '奴才缩在府里没敢露面'),
           ),
           h(
             Field,
@@ -187,6 +484,64 @@ window.__ModuleLoader__.load({
             'p',
             { style: hint },
             '这里只显示当前用的模型。要换模型请在「与和大人说话」窗口顶部那个下拉里选——选完立刻生效，下次也记得。',
+          ),
+        ),
+
+        diaryBlock,
+
+        h(
+          'div',
+          { style: card },
+          h('span', { style: { opacity: 0.72 } }, '和珅的胆气与官位'),
+          (() => {
+            const mood = data.mood || {}
+            const left =
+              mood.state && mood.state !== 'normal'
+                ? ` · 再熬 ${mood.stateTurnsLeft} 句 / ${Math.ceil((mood.stateMsLeft || 0) / 1000)} 口气就缓过来`
+                : ''
+            return h(
+              'div',
+              { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+              h(
+                'div',
+                { style: { display: 'flex', alignItems: 'baseline', gap: '8px' } },
+                h('span', { style: { fontSize: '18px', fontWeight: 600 } }, mood.trembleLabel || '—'),
+                h('span', { style: hint }, `/ 10 颤栗值 · 奴才这会儿${mood.stateLabel || '还算稳当'}${left}`),
+              ),
+              h(
+                'div',
+                { style: { display: 'flex', alignItems: 'baseline', gap: '8px' } },
+                h('span', { style: { fontSize: '15px', fontWeight: 600 } }, mood.rankLabel || '—'),
+                h('span', { style: hint }, '皇上赏的官位（一品是百官之首，九品是刚入流）'),
+              ),
+            )
+          })(),
+          h(
+            'div',
+            { style: { display: 'flex', gap: '10px', alignItems: 'center' } },
+            h(
+              'button',
+              {
+                type: 'button',
+                style: {
+                  background: 'rgba(127,127,127,.16)',
+                  color: 'inherit',
+                  border: '1px solid rgba(127,127,127,.35)',
+                  borderRadius: '8px',
+                  padding: '4px 12px',
+                  fontSize: '12px',
+                  cursor: 'pointer',
+                },
+                onClick: () => void save({ resetMood: true }, '奴才把心气收回原样了'),
+              },
+              '把心气归回原样',
+            ),
+            h('span', { style: hint }, '颤栗值回五分、官位回一品，吓破的胆和乐上头一并散了'),
+          ),
+          h(
+            'p',
+            { style: hint },
+            '皇上骂奴才、盘问奴才，奴才腿肚子就转筋；皇上赏奴才、疼奴才，奴才心里就松快。松快到零，奴才就飘得没边儿；紧到十分，奴才只剩下磕头。挨两句狠的（打入死牢、即刻问斩这种），奴才当场吓破胆；连着赏两回大的（黄马褂、黄金万两），奴才乐得找不着北。没头没脑的闲话，奴才自己会慢慢缓回常态。',
           ),
         ),
 

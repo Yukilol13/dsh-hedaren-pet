@@ -59,7 +59,7 @@
     background: rgba(52, 30, 20, .97);
     box-shadow: 0 8px 24px rgba(0,0,0,.4), 0 0 0 1px rgba(255,152,0,.55) inset;
   }
-  #workText { font-weight: 600; max-height: 62px; overflow: hidden; }
+  #workText { font-weight: 600; max-height: 62px; overflow: hidden; white-space: pre-line; }
   #workBar {
     height: 6px; margin: 7px 0 4px;
     border-radius: 999px; background: rgba(255,255,255,.14); overflow: hidden;
@@ -120,6 +120,8 @@ const FACE_BY_ANIM = {
 
 let lastSayId = -1
 let lastRender = ''
+let sayShownAt = 0
+const SAY_WORK_HOLD_MS = 3200 // 干活时插播的气泡：3 秒多后让回工作面板
 
 function pick(list) { return list[Math.floor(Math.random() * list.length)] }
 function prefixNow() { return pick(PREFIX) }
@@ -127,9 +129,10 @@ function prefixNow() { return pick(PREFIX) }
 function renderWork(work) {
   const approval = work.state === 'approval'
   const task = work.task || (approval ? '请您示下' : '点着钞票候旨')
+  // 换行放在冒号后面：自称和这句话连着一行，办的事另起一行
   workText.textContent = approval
-    ? `${prefixNow()}，有一事请旨：${work.approval || task}`
-    : `${prefixNow()}，奴才正给您办：${task}`
+    ? `${prefixNow()}，有一事请旨：\n${work.approval || task}`
+    : `${prefixNow()}，奴才正给您办：\n${task}`
   const total = Number(work.total) || 0
   const done = Number(work.done) || 0
   if (total > 0) {
@@ -174,6 +177,28 @@ function applyState(state) {
   if (!state) return
   const workActive = Boolean(state.work && state.work.active)
   if (workActive) {
+    // 干活时插播一句（点播动作/点击带的台词）：先让这句话冒个泡，
+    // 过一会儿把「正在办什么」的工作面板放回来，不能一直挂着那句台词。
+    const sayId = Number(state.say?.id) || 0
+    if (sayId && sayId !== lastSayId) {
+      lastSayId = sayId
+      sayShownAt = Date.now()
+      const animName = state.anim?.name || ''
+      const explicitFace = state.say.face
+      const face =
+        explicitFace === 'none'
+          ? 'none'
+          : explicitFace || FACE_BY_ANIM[animName] || '02-算计'
+      showBubble(state.say.text || '', face)
+      return
+    }
+    if (bubble.classList.contains('show')) {
+      if (Date.now() - sayShownAt >= SAY_WORK_HOLD_MS) {
+        lastRender = ''
+        renderWork(state.work)
+      }
+      return
+    }
     const sig = JSON.stringify([
       state.work.state,
       state.work.task,
@@ -191,6 +216,7 @@ function applyState(state) {
   const sayId = Number(state.say?.id) || 0
   if (sayId && sayId !== lastSayId) {
     lastSayId = sayId
+    sayShownAt = Date.now()
     const animName = state.anim?.name || '待机-呼吸'
     const explicitFace = state.say.face
     const face =
