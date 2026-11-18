@@ -13,10 +13,21 @@
     cursor: grab;
   }
   body:active { cursor: grabbing; }
+  /* 本体图层：位置/尺寸由主进程的 win:layout 给（画布余量让它不再等于整个窗口） */
   #wrap {
-    position: absolute; inset: 0;
+    position: absolute; left: 0; top: 0; width: 100%; height: 100%;
     transform-origin: 50% 100%;
     pointer-events: none;
+  }
+  /* 气泡 / 右键菜单：同一块画布里的子框架（同一渲染进程，不额外开进程） */
+  #bubbleFrame, #menuFrame {
+    position: absolute; left: 0; top: 0;
+    border: 0; padding: 0; margin: 0;
+    background: transparent;
+    overflow: hidden;
+    /* 隐藏时用 visibility 而不是 display:none —— display:none 的 iframe 不布局，
+       里面的菜单量出来是 0 高（会被当成"只有 80px 高"）。 */
+    visibility: hidden;
   }
   #wrap.squash { animation: petSquash .32s cubic-bezier(.2,.8,.3,1); }
   @keyframes petSquash {
@@ -47,11 +58,61 @@
 </head>
 <body>
 <div id="wrap"><div id="flip"><img id="anim" alt="" /></div></div>
+<iframe id="bubbleFrame" src="bubble.html" scrolling="no" title="气泡"></iframe>
+<iframe id="menuFrame" src="menu.html" scrolling="no" title="菜单"></iframe>
 <script>
 const $ = (s) => document.querySelector(s)
 const wrap = $('#wrap')
 const flipEl = $('#flip')
 const animEl = $('#anim')
+const bubbleFrame = $('#bubbleFrame')
+const menuFrame = $('#menuFrame')
+let wrapLeft = 0
+let wrapTop = 0
+let wrapWidth = 0
+let wrapHeight = 0
+let lastLayout = null
+
+/**
+ * 画布排版：主进程算好本体偏移与气泡/菜单矩形后推过来。
+ * 气泡和菜单只是"摆进来的 iframe"，窗口尺寸不随它们变（余量是固定的）。
+ */
+function applyLayout(layout) {
+  if (!layout) return
+  lastLayout = layout
+  wrapLeft = layout.ox
+  wrapTop = layout.oy
+  wrapWidth = layout.petW
+  wrapHeight = layout.petH
+  wrap.style.left = `${layout.ox}px`
+  wrap.style.top = `${layout.oy}px`
+  wrap.style.width = `${layout.petW}px`
+  wrap.style.height = `${layout.petH}px`
+  for (const [frame, box, fallbackSize] of [
+    [bubbleFrame, layout.bubble, { w: 300, h: 132 }],
+    [menuFrame, layout.menu, { w: 336, h: 470 }],
+  ]) {
+    if (!box) {
+      // 隐藏但保留布局：给个默认尺寸，里面的页面才量得出真实内容高
+      frame.style.visibility = 'hidden'
+      frame.style.pointerEvents = 'none'
+      frame.style.width = `${fallbackSize.w}px`
+      frame.style.height = `${fallbackSize.h}px`
+      continue
+    }
+    frame.style.visibility = 'visible'
+    frame.style.pointerEvents = 'auto'
+    frame.style.left = `${box.x}px`
+    frame.style.top = `${box.y}px`
+    frame.style.width = `${box.w}px`
+    frame.style.height = `${box.h}px`
+  }
+}
+/** 点在不在本体矩形里（画布坐标） */
+function inBody(x, y) {
+  return x >= wrapLeft && x < wrapLeft + wrapWidth && y >= wrapTop && y < wrapTop + wrapHeight
+}
+window.heshen.onLayout?.(applyLayout)
 
 const PAD = 4
 const THROW_WINDOW_MS = 140      // 只统计松手前这一段轨迹
@@ -754,8 +815,19 @@ window.addEventListener('mouseenter', () => {
 })
 
 // 拖动 + 松手弹射（按加速度判定）
+// 光标一进画布就催一次穿透判定（主进程 60ms 轮询的补丁，右键/点击不会慢一拍）
+let probeAt = 0
+window.addEventListener('mousemove', () => {
+  const now = performance.now()
+  if (now - probeAt < 30) return
+  probeAt = now
+  window.heshen.probePointer?.()
+})
+
 window.addEventListener('mousedown', (e) => {
   if (e.button !== 0) return
+  // 余量区（透明的那圈）不接拖拽/点击：只有真的按在本体上才算
+  if (!inBody(e.clientX, e.clientY)) return
   window.heshen.closeMenu() // 左键落下时先收起右键菜单，保证一定能拖
   window.heshen.stopThrow()
   // 万一「甩飞」形象卡住了，用户一抓就恢复待机
@@ -768,6 +840,7 @@ window.addEventListener('mousedown', (e) => {
     returnToIdle()
   }
   wrap.classList.remove('squash')
+  window.heshen.setDragBusy?.(true) // 拖拽租约：这期间主进程不许把画布切成穿透
   drag = {
     x: e.screenX,
     y: e.screenY,
@@ -894,11 +967,19 @@ window.addEventListener('mouseup', (e) => {
     }
   }
   drag = null
+  window.heshen.setDragBusy?.(false) // 松手：交还给光标守卫判定穿透
   if (!wasMoved && e.button === 0) clickPet()
+})
+
+// 菜单开着时按 Esc 收起（画布不吃焦点，靠主框架转一下键盘事件）
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') window.heshen.closeMenu()
 })
 
 window.addEventListener('contextmenu', (e) => {
   e.preventDefault()
+  // 只有在本体上右键才弹菜单；余量区（透明那圈）右键不该有反应
+  if (!inBody(e.clientX, e.clientY)) return
   window.heshen.openMenu({ x: Math.round(e.screenX), y: Math.round(e.screenY) })
 })
 

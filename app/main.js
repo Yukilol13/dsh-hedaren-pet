@@ -17,6 +17,15 @@ const capture = require('./capture')
 const winprobe = require('./winprobe')
 
 /**
+ * 应用名写死成「和大人」：托盘提示、任务管理器里的应用名、进程分组都按它来。
+ * userData 目录仍钉在原来的 heshen-desktop-pet-app，改名不会丢窗口位置/本地存储。
+ */
+try {
+  app.setName('和大人')
+  app.setPath('userData', path.join(app.getPath('appData'), 'heshen-desktop-pet-app'))
+} catch {}
+
+/**
  * 透明置顶窗被别的窗口整块盖住时，Chromium 会把这类窗口记为「被遮挡」并暂停合成，
  * webp 动画/CSS 呼吸就停在最后一帧——表现就是「和大人不动了，点一下或开个菜单又活了」。
  * 这几条开关把后台化/遮挡降频关掉，让它一直按正常帧率跑。
@@ -66,7 +75,12 @@ function writeJailThreshold(value) {
   }
 }
 
-const MENU_W = 236
+// 菜单是「主列 + 悬停展开的二级列」，两块并排放在画布里；只有这两块矩形吃点击
+const MENU_COL_W = 220
+const MENU_SUB_W = 206
+const MENU_GAP = 6
+const MENU_BOX_W = MENU_COL_W + MENU_GAP + MENU_SUB_W
+const MENU_MAX_H = 560 // 菜单首次弹出时按这个高度开画布，量到真实高度后再收紧
 const CHAT_W = 330
 const CHAT_H = 360
 
@@ -95,8 +109,19 @@ const FLOOR_FRICTION = 2.5
 const MAX_SPEED = 3600
 
 let win = null
-let bubbleWin = null
-let menuWin = null
+/**
+ * 架构：**一个窗口 = 一块画布**（跟 dsh-pet 一样）。
+ * 角色本体、气泡、右键菜单都画在 win 这个渲染进程里的三个图层上，
+ * 窗口按需扩缩把三层都框进去，透明区域用 setIgnoreMouseEvents(forward) 打穿。
+ * 所以常驻进程数是 main + GPU + network + renderer = 4。
+ */
+let petRect = { x: 0, y: 0, w: 200, h: 259 } // 角色本体占的屏幕矩形（DIP，含 PAD）
+let canvasRect = { x: 0, y: 0, w: 200, h: 259 } // 当前窗口矩形（DIP）
+let bubbleBox = null // 气泡图层的屏幕矩形（DIP）；null = 不显示
+let menuBox = null // 菜单图层的屏幕矩形（DIP）；null = 菜单收起
+let menuRegions = [] // 菜单里真正吃点击的矩形（主列 / 二级列），空 = 退回整块 menuBox
+let layoutSig = '' // 上一次发给渲染端的布局签名，避免每帧重发
+let interactive = null // 当前是否可点（null = 还没同步过）
 let chatWin = null
 let tray = null
 let saveTimer = null
@@ -106,6 +131,7 @@ let sayTimer = null
 let keepTopTimer = null
 let menuWatchdog = null
 let bubbleContentH = BUBBLE_H
+let menuContentH = MENU_MAX_H
 let fishTarget = null // state.dshpet：大肥鱼此刻的屏幕框（DIP）
 let captureLock = false // 一次碰撞只判定一次，等动画播完再解锁
 let fishPresent = true // 槽位里此刻有没有大肥鱼（像素检测）
@@ -160,42 +186,116 @@ function writeState(next) {
 }
 
 function petBounds() {
-  if (!win) return null
-  const b = win.getBounds()
-  return b
+  return { x: petRect.x, y: petRect.y, width: petRect.w, height: petRect.h }
 }
 
-/** 让气泡、聊天的位置跟着和大人走。 */
-function syncSatellites() {
-  const pet = petBounds()
-  if (!pet) return
-  if (bubbleWin && !bubbleWin.isDestroyed()) {
-    const area = screen.getDisplayMatching(pet).workArea
-    const h = Math.max(48, Math.min(BUBBLE_H, Math.round(bubbleContentH)))
-    const x = Math.round(pet.x + pet.width / 2 - BUBBLE_W / 2)
-    // 气泡窗口高度=内容高度，底部贴着角色窗口上沿（+2 让箭头压住帽顶）
-    const y = Math.round(pet.y - h + 2)
-    bubbleWin.setBounds({
-      x: Math.min(Math.max(area.x + 4, x), area.x + area.width - BUBBLE_W - 4),
-      y: Math.min(Math.max(area.y + 4, y), area.y + area.height - h - 4),
-      width: BUBBLE_W,
-      height: h,
-    })
+/**
+ * 画布余量：跟 dsh-pet 一样「窗口 = 本体 + 四周透明余量」，气泡和菜单都画在余量里。
+ * 固定余量 = 平时一次 resize 都不做（气泡反复出现/消失不会抖）；菜单超高时才临时长高。
+ */
+const CANVAS_MARGIN = { l: 120, r: 120, t: 150, b: 96 }
+
+/** 两个屏幕矩形求并：画布 = 本体+余量 ∪ 气泡 ∪ 菜单 */
+function unionRect(a, b) {
+  if (!b) return a
+  const x = Math.min(a.x, b.x)
+  const y = Math.min(a.y, b.y)
+  const right = Math.max(a.x + a.w, b.x + b.w)
+  const bottom = Math.max(a.y + a.h, b.y + b.h)
+  return { x, y, w: right - x, h: bottom - y }
+}
+
+/** 本体 + 固定余量 = 基础画布 */
+function baseCanvasRect() {
+  return {
+    x: petRect.x - CANVAS_MARGIN.l,
+    y: petRect.y - CANVAS_MARGIN.t,
+    w: petRect.w + CANVAS_MARGIN.l + CANVAS_MARGIN.r,
+    h: petRect.h + CANVAS_MARGIN.t + CANVAS_MARGIN.b,
   }
 }
 
+/** 气泡图层放哪：贴在基础画布上方留白里（不参与 resize，所以画布尺寸恒定） */
+function bubbleRectFor(height) {
+  const h = Math.max(48, Math.min(BUBBLE_H, Math.round(height || BUBBLE_H)))
+  const w = BUBBLE_W
+  const base = baseCanvasRect()
+  const x = Math.round(petRect.x + petRect.w / 2 - w / 2)
+  // 底部贴着本体上沿，但整体必须留在画布内（画布会因菜单临时变化，所以在这重新取一次）
+  const r = unionRect(base, menuBox)
+  const bottomAligned = Math.round(petRect.y - h + 2)
+  const y = Math.max(r.y + 4, bottomAligned)
+  return {
+    x: Math.min(Math.max(r.x + 4, x), r.x + r.w - w - 4),
+    y: Math.min(y, r.y + r.h - h - 4),
+    w,
+    h,
+  }
+}
+
+/** 画布变了就改窗口尺寸，并把三层在窗口内的偏移告诉渲染端 */
+function applyCanvas() {
+  if (!win || win.isDestroyed()) return
+  let r = baseCanvasRect()
+  r = unionRect(r, menuBox)
+  canvasRect = r
+  const cur = win.getBounds()
+  const x = Math.round(r.x)
+  const y = Math.round(r.y)
+  const width = Math.round(r.w)
+  const height = Math.round(r.h)
+  if (cur.x !== x || cur.y !== y || cur.width !== width || cur.height !== height) {
+    win.setBounds({ x, y, width, height })
+  }
+  const layout = {
+    ox: Math.round(petRect.x - r.x),
+    oy: Math.round(petRect.y - r.y),
+    petW: Math.round(petRect.w),
+    petH: Math.round(petRect.h),
+    bubble: bubbleBox
+      ? { x: Math.round(bubbleBox.x - r.x), y: Math.round(bubbleBox.y - r.y), w: bubbleBox.w, h: bubbleBox.h }
+      : null,
+    menu: menuBox
+      ? { x: Math.round(menuBox.x - r.x), y: Math.round(menuBox.y - r.y), w: menuBox.w, h: menuBox.h, side: menuBox.side || 'right' }
+      : null,
+  }
+  const sig = JSON.stringify(layout)
+  if (sig === layoutSig) return
+  layoutSig = sig
+  try {
+    win.webContents.send('win:layout', layout)
+  } catch {}
+}
+
+/** 让气泡、菜单的位置跟着和大人走（旧接口，位置现在由画布统一算） */
+function syncSatellites() {
+  if (!win || win.isDestroyed() || !bubbleBox) return
+  const next = bubbleRectFor(bubbleBox.h || bubbleContentH)
+  if (bubbleBox.x === next.x && bubbleBox.y === next.y && bubbleBox.h === next.h) return
+  bubbleBox = next
+  applyCanvas()
+}
+
 function showBubbleWindow() {
-  if (!bubbleWin || bubbleWin.isDestroyed()) return
-  syncSatellites()
-  if (!bubbleWin.isVisible()) bubbleWin.showInactive()
-  bubbleWin.moveTop()
+  if (!win || win.isDestroyed()) return
+  const next = bubbleRectFor(bubbleContentH)
+  if (bubbleBox && bubbleBox.x === next.x && bubbleBox.y === next.y && bubbleBox.h === next.h) return
+  bubbleBox = next
+  applyCanvas()
 }
 
 function hideBubbleWindow() {
-  if (bubbleWin && !bubbleWin.isDestroyed() && bubbleWin.isVisible()) bubbleWin.hide()
+  if (!bubbleBox) return
+  bubbleBox = null
+  applyCanvas()
+}
+
+function bubbleVisible() {
+  return Boolean(bubbleBox)
 }
 
 function openChat() {
+  ensureChatWindow()
   if (!chatWin || chatWin.isDestroyed()) return
   const pet = petBounds()
   if (pet) {
@@ -213,39 +313,90 @@ function openChat() {
   chatWin.focus()
 }
 
+/**
+ * 聊天窗是惰性窗口：用到才建，关掉就销毁。
+ * 这样一个渲染进程都不白占（闲置时进程数 = main + GPU + network + 角色 = 4）。
+ */
 function closeChat() {
-  if (chatWin && !chatWin.isDestroyed()) chatWin.hide()
+  if (!chatWin || chatWin.isDestroyed()) return
+  const target = chatWin
+  chatWin = null
+  try {
+    target.hide()
+  } catch {}
+  // 先 hide 再 destroy，避免关窗动画里直接炸掉渲染进程
+  setTimeout(() => {
+    try {
+      if (!target.isDestroyed()) target.destroy()
+    } catch {}
+  }, 60)
+}
+
+/**
+ * 直接给画布里的某个 iframe 发消息。
+ * `webContents.send` 只到主框架，postMessage 又要靠主框架转发（链路长、容易丢），
+ * 这里用 webFrameMain.send 精确投递。
+ */
+function sendToFrame(match, channel, ...args) {
+  try {
+    for (const frame of win.webContents.mainFrame.frames) {
+      if (frame.url && frame.url.includes(match)) frame.send(channel, ...args)
+    }
+  } catch {}
 }
 
 function openMenu(x, y) {
-  if (!menuWin || menuWin.isDestroyed()) return
+  if (!win || win.isDestroyed()) return
   const area = screen.getDisplayNearestPoint({ x, y }).workArea
-  const height = Math.min(420, area.height - 20)
-  const px = Math.min(Math.max(area.x + 6, Math.round(x)), area.x + area.width - MENU_W - 6)
+  const height = Math.min(menuContentH || MENU_MAX_H, area.height - 20)
+  // 主列要贴在光标那一侧；二级列往旁边弹，右边没地方就翻到左边
+  const roomRight = area.x + area.width - 6 - Math.round(x)
+  const side = roomRight >= MENU_COL_W + 6 + MENU_SUB_W ? 'right' : 'left'
+  const anchor = Math.round(x)
+  const px = Math.min(
+    Math.max(area.x + 6, side === 'right' ? anchor : anchor - MENU_BOX_W + MENU_COL_W),
+    area.x + area.width - MENU_BOX_W - 6,
+  )
   const py = Math.min(Math.max(area.y + 6, Math.round(y)), area.y + area.height - height - 6)
-  menuWin.setBounds({ x: px, y: py, width: MENU_W, height })
-  menuWin.show()
-  menuWin.setAlwaysOnTop(true, 'screen-saver')
-  menuWin.moveTop()
-  menuWin.focus()
+  menuBox = { x: px, y: py, w: MENU_BOX_W, h: height, side }
+  menuRegions = []
+  applyCanvas()
+  win.moveTop()
   menuOpenAt = Date.now()
   startMenuWatchdog()
-  menuWin.webContents.send('menu:opened')
+  // 菜单是画布里的 iframe：精确投给那个子框架（先给边，再让它重铺一遍）
+  sendToFrame('menu.html', 'menu:side', menuBox.side)
+  sendToFrame('menu.html', 'menu:opened')
 }
 
-/** 菜单是独立置顶窗，主窗口不可聚焦时不会触发 blur；用光标位置判断「点外面」。 */
+/** 菜单里真正吃点击的矩形（主列 + 展开的二级列），由菜单自己量好上报 */
+ipcMain.on('menu:regions', (_event, rects) => {
+  if (!menuBox || !Array.isArray(rects)) return
+  menuRegions = rects
+    .filter((r) => r && Number(r.w) > 0 && Number(r.h) > 0)
+    .map((r) => ({
+      x: menuBox.x + Number(r.x || 0),
+      y: menuBox.y + Number(r.y || 0),
+      w: Number(r.w),
+      h: Number(r.h),
+    }))
+})
+
+/** 菜单是同一块画布上的图层，主窗口不可聚焦时不会触发 blur；用光标位置判断「点外面」。 */
 function startMenuWatchdog() {
   stopMenuWatchdog()
   menuOutsideTicks = 0
+  // 自检模式：菜单不自动收（截图/量尺寸时要用）
+  if (fs.existsSync(path.join(STATE_DIR, 'test-menu.flag'))) return
   menuWatchdog = setInterval(() => {
-    if (!menuWin || menuWin.isDestroyed() || !menuWin.isVisible()) {
+    if (!menuBox) {
       stopMenuWatchdog()
       return
     }
-    const b = menuWin.getBounds()
+    const b = menuBox
     const p = screen.getCursorScreenPoint()
     const inside =
-      p.x >= b.x - 6 && p.x <= b.x + b.width + 6 && p.y >= b.y - 6 && p.y <= b.y + b.height + 6
+      p.x >= b.x - 6 && p.x <= b.x + b.w + 6 && p.y >= b.y - 6 && p.y <= b.y + b.h + 6
     if (inside) {
       menuOutsideTicks = 0
       return
@@ -269,9 +420,16 @@ function stopMenuWatchdog() {
 
 function hideMenu() {
   stopMenuWatchdog()
-  if (menuWin && !menuWin.isDestroyed() && menuWin.isVisible()) menuWin.hide()
+  if (!menuBox) return
+  menuBox = null
+  menuRegions = []
+  applyCanvas()
   // 菜单收起后把工作中的气泡补回来
   if (readState().work?.active) showBubbleWindow()
+}
+
+function menuVisible() {
+  return Boolean(menuBox)
 }
 
 function showPet() {
@@ -400,7 +558,7 @@ function startStateWatcher() {
         sayTimer = null
       }
       // 菜单打开时不抬气泡，避免盖住菜单
-      if (!(menuWin && !menuWin.isDestroyed() && menuWin.isVisible())) showBubbleWindow()
+      if (!menuVisible()) showBubbleWindow()
     } else if (!sayTimer && sayId === lastSayId) {
       hideBubbleWindow()
     }
@@ -836,7 +994,14 @@ async function detectFish() {
     let foundHits = 0
     // 注意：下面循环变量也叫 win（捕获结果），会遮蔽模块级的和大人窗口。
     // 自己的位置必须在循环前取好，否则自替换永远拿到 null。
-    const selfBounds = win && typeof win.getBounds === 'function' ? win.getBounds() : null
+    // 用「本体矩形」而不是窗口矩形：窗口现在是一整块画布，气泡/菜单展开时会比本体大得多，
+    // 拿整窗去排除会把画布覆盖范围内的大肥鱼全当成自己丢掉。
+    const selfBounds = {
+      x: petRect.x + 4,
+      y: petRect.y + 4,
+      width: Math.max(1, petRect.w - 8),
+      height: Math.max(1, petRect.h - 8),
+    }
     for (const win of windows) {
       const img = win.image || (win.png ? require('electron').nativeImage.createFromPath(win.png) : null)
       const scan = scanImage(img, win.kind)
@@ -1035,9 +1200,14 @@ function throwWindow(vx, vy) {
       `fishAge=${fishDetectAt ? Date.now() - fishDetectAt : -1}ms ` +
       `slots=${fishSlots.map((x) => `${x.from}@${x.x},${x.y} ${x.w}x${x.h}`).join(' ') || 'none'}`,
   )
-  const bounds = win.getBounds()
+  const bounds = { ...petRect }
   // 尺寸在飞行中可能变（甩飞形象比待机宽）：每帧现算边界，别用起飞那一刻的尺寸
-  const area = screen.getDisplayMatching(bounds).workArea
+  const area = screen.getDisplayMatching({
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.w,
+    height: bounds.h,
+  }).workArea
   const minX = area.x
   const minY = area.y
   const startSize = intendedSize()
@@ -1142,9 +1312,11 @@ function throwWindow(vx, vy) {
 
     // 还在飞：持续告诉渲染端「举网要继续」
     publishThrowState(Math.abs(svx) > 20 || Math.abs(svy) > 20, svx < 0 ? 'left' : 'right')
-    // 只改位置，尺寸显式写死，避免 DPI 取整把窗口越抛越大
-    win.setBounds({ x: Math.round(x), y: Math.round(y), width, height })
-    syncSatellites()
+    // 只改本体位置；窗口尺寸/位置由 applyCanvas 统一跟随（气泡、菜单要一起框进去）
+    petRect = { x: Math.round(x), y: Math.round(y), w: width, h: height }
+    // 飞的时候气泡也得跟着：它现在贴在画布的固定偏移上，不重算就会被甩出画布
+    if (bubbleBox) bubbleBox = bubbleRectFor(bubbleBox.h || bubbleContentH)
+    applyCanvas()
     if (svx === 0 && svy === 0) stopThrow()
     // 硬超时兜底：8 秒还没停下就强制收尾，避免「举着网卡住/拖不动」
     else if (Date.now() - throwStartedAt > 8000) {
@@ -1185,6 +1357,8 @@ function baseWebPreferences(preload) {
     nodeIntegration: false,
     sandbox: false,
     backgroundThrottling: false,
+    // iframe 也要拿到 preload（气泡、菜单都是画在同一条渲染进程里的子框架）
+    nodeIntegrationInSubFrames: true,
   }
 }
 
@@ -1202,12 +1376,20 @@ function createPetWindow() {
   const fallback = defaultPosition(width, height)
   const hasX = state.x !== null && state.x !== undefined && Number.isFinite(Number(state.x))
   const hasY = state.y !== null && state.y !== undefined && Number.isFinite(Number(state.y))
-
-  win = new BrowserWindow({
-    width,
-    height,
+  petRect = {
     x: hasX ? Number(state.x) : fallback.x,
     y: hasY ? Number(state.y) : fallback.y,
+    w: width,
+    h: height,
+  }
+  // 窗口是「画布」：比本体大一圈，位置也要按画布算（本体在画布里偏 (l, t)）
+  canvasRect = baseCanvasRect()
+
+  win = new BrowserWindow({
+    width: canvasRect.w,
+    height: canvasRect.h,
+    x: canvasRect.x,
+    y: canvasRect.y,
     frame: false,
     transparent: true,
     backgroundColor: '#00000000',
@@ -1218,13 +1400,16 @@ function createPetWindow() {
     hasShadow: false,
     focusable: false,
     show: false,
+    // 画布四周的透明余量允许伸出屏幕（dsh-pet 同款），否则贴边时气泡/菜单会被裁掉
+    enableLargerThanScreen: true,
     webPreferences: baseWebPreferences(path.join(__dirname, 'preload.js')),
   })
 
   win.setAlwaysOnTop(true, 'screen-saver')
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
-  // 主窗口就是角色本身，必须整窗可点，否则整只和大人都会变成点击穿透
-  win.setIgnoreMouseEvents(false)
+  // 画布整窗默认穿透，渲染端判定「指到东西了」再打开（见 setInteractive）
+  interactive = null
+  setInteractive(false)
   win.webContents.on('console-message', (_event, level, message, line, sourceId) => {
     log(`renderer[${level}] ${message} (${sourceId}:${line})`)
   })
@@ -1236,29 +1421,48 @@ function createPetWindow() {
       win.setAlwaysOnTop(true, 'screen-saver')
       win.moveTop()
     }
-    syncSatellites()
+    applyCanvas()
+    // 自检钩子：放一个 test-menu.flag 文件就自动在身体右上角弹一次菜单（量画布/截图用）
+    if (fs.existsSync(path.join(STATE_DIR, 'test-menu.flag'))) {
+      setTimeout(() => {
+        if (!win || win.isDestroyed()) return
+        openMenu(petRect.x + petRect.w - 20, petRect.y + 24)
+        setTimeout(() => {
+          log(
+            `selftest menu box=${JSON.stringify(menuBox)} canvas=${JSON.stringify(canvasRect)} ` +
+              `regions=${JSON.stringify(menuRegions)}`,
+          )
+        }, 800)
+      }, 2200)
+    }
   })
   {
     // 可选初始状态：常服（#changfu）、镜像（#mirror），测试用
     const hash = []
     win.loadFile(path.join(__dirname, 'pet.html'), hash.length ? { hash: hash.join('-') } : undefined)
-  // 启动时把已保存的亏空阈值同步进 state，右键菜单才能显示当前值
-  try {
-    writeState({ jailThreshold: readJailThreshold() })
-  } catch {}
-
+    // 启动时把已保存的亏空阈值同步进 state，右键菜单才能显示当前值
+    try {
+      writeState({ jailThreshold: readJailThreshold() })
+    } catch {}
   }
   win.once('ready-to-show', () => {
     if (readState().visible !== false) win.show()
   })
-  win.on('move', () => syncSatellites())
+  // 窗口位置由我们算（画布 + 本体偏移），只有用户用别的手段移动过才需要反推
   win.on('moved', () => {
-    syncSatellites()
+    if (!win || win.isDestroyed()) return
+    const b = win.getBounds()
+    const ox = Math.round(petRect.x - canvasRect.x)
+    const oy = Math.round(petRect.y - canvasRect.y)
+    if (b.x !== canvasRect.x || b.y !== canvasRect.y) {
+      canvasRect = { x: b.x, y: b.y, w: b.width, h: b.height }
+      petRect = { ...petRect, x: b.x + ox, y: b.y + oy }
+      layoutSig = ''
+      applyCanvas()
+    }
     if (saveTimer) clearTimeout(saveTimer)
     saveTimer = setTimeout(() => {
-      if (!win) return
-      const [px, py] = win.getPosition()
-      writeState({ x: px, y: py })
+      writeState({ x: Math.round(petRect.x), y: Math.round(petRect.y) })
     }, 250)
   })
   win.on('closed', () => {
@@ -1267,54 +1471,12 @@ function createPetWindow() {
   })
 }
 
-function createBubbleWindow() {
-  bubbleWin = new BrowserWindow({
-    width: BUBBLE_W,
-    height: BUBBLE_H,
-    frame: false,
-    transparent: true,
-    backgroundColor: '#00000000',
-    resizable: false,
-    movable: false,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    hasShadow: false,
-    focusable: false,
-    show: false,
-    webPreferences: baseWebPreferences(path.join(__dirname, 'preload.js')),
-  })
-  // 气泡层级压在菜单/对话之下，保证右键菜单不会被提示框盖住
-  bubbleWin.setAlwaysOnTop(true, 'floating')
-  bubbleWin.setIgnoreMouseEvents(true, { forward: true })
-  bubbleWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
-  bubbleWin.loadFile(path.join(__dirname, 'bubble.html'))
-  bubbleWin.webContents.on('did-finish-load', () => log('bubble did-finish-load'))
-}
-
-function createMenuWindow() {
-  menuWin = new BrowserWindow({
-    width: MENU_W,
-    height: 420,
-    frame: false,
-    transparent: true,
-    backgroundColor: '#00000000',
-    resizable: false,
-    movable: false,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    hasShadow: false,
-    focusable: true,
-    show: false,
-    webPreferences: baseWebPreferences(path.join(__dirname, 'preload.js')),
-  })
-  menuWin.setAlwaysOnTop(true, 'screen-saver')
-  menuWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
-  menuWin.loadFile(path.join(__dirname, 'menu.html'))
-  menuWin.on('blur', () => hideMenu())
-  menuWin.webContents.on('did-finish-load', () => log('menu did-finish-load'))
-}
-
-function createChatWindow() {
+/**
+ * 聊天窗：惰性创建。用到才建，关掉就销毁——闲置时它不占渲染进程。
+ * （气泡和右键菜单是画布上的 iframe，不再需要各自开窗口。）
+ */
+function ensureChatWindow() {
+  if (chatWin && !chatWin.isDestroyed()) return chatWin
   chatWin = new BrowserWindow({
     width: CHAT_W,
     height: CHAT_H,
@@ -1336,14 +1498,16 @@ function createChatWindow() {
   chatWin.on('blur', () => {
     // 点外面只收输入焦点，不关窗口；用户用 × 或 Esc 关
   })
+  chatWin.on('closed', () => {
+    chatWin = null
+  })
   chatWin.webContents.on('did-finish-load', () => log('chat did-finish-load'))
+  return chatWin
 }
 
 function createWindow() {
   createPetWindow()
-  createBubbleWindow()
-  createMenuWindow()
-  createChatWindow()
+  startPointerGuard()
   setupTray()
   startStateWatcher()
   keepPetOnTop()
@@ -1362,7 +1526,7 @@ function keepPetOnTop() {
   if (keepTopTimer) clearInterval(keepTopTimer)
   keepTopTimer = setInterval(() => {
     if (!win || win.isDestroyed() || !win.isVisible()) return
-    if (menuWin && !menuWin.isDestroyed() && menuWin.isVisible()) return
+    if (menuVisible()) return
     if (chatWin && !chatWin.isDestroyed() && chatWin.isVisible()) return
     if (thresholdWin && !thresholdWin.isDestroyed() && thresholdWin.isVisible()) return
     try {
@@ -1387,12 +1551,11 @@ ipcMain.on('pet:metrics', (_event, payload) => {
   const inkH = Math.max(1, Math.round(Number(payload.height) * scale))
   const width = inkW + PAD * 2
   const height = inkH + PAD * 2
-  // 帽子中心在窗口内的横向位置：换/缩放动作时以它为锚点，角色不会左右跳
+  // 帽子中心在本体矩形里的横向位置：换/缩放动作时以它为锚点，角色不会左右跳
   const anchorPx = Math.round((Number(payload.anchorX) || inkW / 2) * scale) + PAD
-  const bounds = win.getBounds()
   const scaleChanged = Math.abs(scale - currentMetrics.scale) > 0.001
-  const oldAnchorPx = currentMetrics.anchorPx ?? Math.round(bounds.width / 2)
-  const anchorScreenX = bounds.x + oldAnchorPx
+  const oldAnchorPx = currentMetrics.anchorPx ?? Math.round(petRect.w / 2)
+  const anchorScreenX = petRect.x + oldAnchorPx
   currentMetrics = {
     width: Number(payload.width) || currentMetrics.width,
     height: Number(payload.height) || currentMetrics.height,
@@ -1401,24 +1564,21 @@ ipcMain.on('pet:metrics', (_event, payload) => {
   }
   log(
     `metrics ${payload.name || '?'} ink ${inkW}x${inkH} -> ${width}x${height} ` +
-      `bounds ${bounds.width}x${bounds.height} scale=${scale}`,
+      `pet ${petRect.w}x${petRect.h} scale=${scale}`,
   )
-  if (
-    Math.abs(bounds.width - width) <= 2 &&
-    Math.abs(bounds.height - height) <= 2 &&
-    !scaleChanged
-  ) {
+  if (Math.abs(petRect.w - width) <= 2 && Math.abs(petRect.h - height) <= 2 && !scaleChanged) {
     return
   }
-  win.setBounds({
+  // 本体以「脚底 + 帽子中心」为锚点改尺寸，角色不会跳
+  petRect = {
     x: Math.round(anchorScreenX - anchorPx),
-    y: Math.round(bounds.y + bounds.height - height),
-    width,
-    height,
-  })
-  const after = win.getBounds()
-  log(`metrics applied -> bounds ${after.width}x${after.height}`)
-  syncSatellites()
+    y: Math.round(petRect.y + petRect.h - height),
+    w: width,
+    h: height,
+  }
+  if (bubbleBox) bubbleBox = bubbleRectFor(bubbleBox.h || bubbleContentH)
+  applyCanvas()
+  log(`metrics applied -> pet ${petRect.w}x${petRect.h}`)
 })
 
 ipcMain.on('win:throw', async (_event, vx, vy) => {
@@ -1441,10 +1601,83 @@ ipcMain.on('win:throwSkip', (_event, info) => {
 ipcMain.on('win:stop', () => stopThrow())
 ipcMain.on('win:ignore', (_event, ignore) => {
   if (!win) return
-  // 窗口已紧贴角色，一旦忽略鼠标整只和大人就点不到，因此主窗口始终可点
-  if (ignore) log('win:ignore(true) 已忽略（主窗口保持可点）')
-  win.setIgnoreMouseEvents(false)
+  // 现在窗口是「画布」，透明区域必须穿透
+  setInteractive(Boolean(ignore) ? false : true)
 })
+
+/** 拖拽租约：拖的时候绝不能翻成穿透，否则 pointermove/pointerup 会断（dsh-pet 的 dragging 分支） */
+ipcMain.on('win:drag', (_event, busy) => {
+  dragBusy = Boolean(busy)
+  if (dragBusy) {
+    hoverMarginMs = 0
+    setInteractive(true)
+  }
+})
+
+/** 光标进入画布时渲染端会立刻叫一声：比等 60ms 轮询快，右键/点击不会「第一下没反应」 */
+ipcMain.on('win:pointer-probe', () => pointerTick())
+
+/** 切整窗是否吃鼠标：不吃时也继续转发移动事件（forward），作快路；权威判定见 pointerTick */
+function setInteractive(on) {
+  if (!win || win.isDestroyed()) return
+  if (interactive === on) return
+  interactive = on
+  try {
+    win.setIgnoreMouseEvents(!on, { forward: true })
+  } catch {}
+}
+
+/**
+ * 光标守卫（照 dsh-pet 的 pointer-target）：
+ * 每 60ms 读一次真实光标，按「本体 / 菜单 / 余量」分区决定整窗穿不穿透。
+ * 不能只靠 forward 鼠标钩子——Windows 上它会静默失效（一失效悬浮、拖拽、右键全哑）。
+ */
+const POINTER_POLL_MS = 60
+const OFF_BODY_RELEASE_MS = 400
+let hoverMarginMs = 0
+let dragBusy = false
+let pointerTimer = null
+
+function inRect(p, r) {
+  return Boolean(r) && p.x >= r.x && p.x < r.x + r.w && p.y >= r.y && p.y < r.y + r.h
+}
+
+function pointerTick() {
+  if (!win || win.isDestroyed()) return
+  const p = screen.getCursorScreenPoint()
+  if (dragBusy) {
+    hoverMarginMs = 0
+    if (interactive !== true) setInteractive(true)
+    return
+  }
+  const onPet = inRect(p, petRect)
+  // 菜单只放行「主列 / 二级列」这两块，其余（菜单框里空着的地方、画布余量）继续穿透
+  const onMenu = menuBox
+    ? menuRegions.length
+      ? menuRegions.some((r) => inRect(p, r))
+      : inRect(p, menuBox)
+    : false
+  if (onPet || onMenu) {
+    hoverMarginMs = 0
+    if (interactive !== true) setInteractive(true)
+    return
+  }
+  if (!inRect(p, canvasRect)) {
+    hoverMarginMs = 0
+    if (interactive !== false) setInteractive(false)
+    return
+  }
+  // 余量区：先保持现状（可能正走向本体），连续停留超时才回到穿透
+  hoverMarginMs += POINTER_POLL_MS
+  if (hoverMarginMs >= OFF_BODY_RELEASE_MS && interactive !== false) setInteractive(false)
+}
+
+function startPointerGuard() {
+  if (pointerTimer) clearInterval(pointerTimer)
+  pointerTimer = setInterval(pointerTick, POINTER_POLL_MS)
+  pointerTimer.unref?.()
+}
+
 function intendedSize() {
   const scale = currentMetrics.scale || 1
   return {
@@ -1455,20 +1688,16 @@ function intendedSize() {
 
 function nudge(dx, dy) {
   if (!win) return
-  const bounds = win.getBounds()
   const { width, height } = intendedSize()
-  const nx = Math.round(bounds.x + Number(dx || 0))
-  const ny = Math.round(bounds.y + Number(dy || 0))
-  if (bounds.width === width && bounds.height === height) {
-    // 尺寸没变就别走 setBounds：Windows 上 setBounds 带 resize 路径，
-    // 透明置顶窗每帧 resize 会掉帧，setPosition 轻得多
-    win.setPosition(nx, ny, false)
-  } else {
-    // 尺寸确实变了才显式带上目标尺寸（只拿当前 bounds 会把 DPI 取整误差放大成「越拖越大」）
-    win.setBounds({ x: nx, y: ny, width, height })
+  // 本体尺寸跟着当前动作的着墨范围走（换动作时窗口大小会变）
+  if (Math.abs(petRect.w - width) > 2 || Math.abs(petRect.h - height) > 2) {
+    petRect = { x: petRect.x, y: petRect.y + petRect.h - height, w: width, h: height }
   }
-  // 气泡没显示时不用跟着搬：以前每次都算，等于每帧多一次窗口定位
-  if (bubbleWin && !bubbleWin.isDestroyed() && bubbleWin.isVisible()) syncSatellites()
+  petRect.x = Math.round(petRect.x + Number(dx || 0))
+  petRect.y = Math.round(petRect.y + Number(dy || 0))
+  // 气泡贴在本体头上：拖动时每帧跟着重算，否则它会留在原地并被画布裁掉
+  if (bubbleBox) bubbleBox = bubbleRectFor(bubbleBox.h || bubbleContentH)
+  applyCanvas()
 }
 
 ipcMain.on('win:move', (_event, dx, dy) => {
@@ -1496,13 +1725,13 @@ ipcMain.on('menu:open', (_event, point) => {
 })
 ipcMain.on('menu:close', () => hideMenu())
 ipcMain.on('menu:resize', (_event, height) => {
-  if (!menuWin || menuWin.isDestroyed()) return
-  const value = Math.max(80, Math.min(460, Math.round(Number(height) || 0)))
-  const bounds = menuWin.getBounds()
-  if (bounds.height === value) return
-  const area = screen.getDisplayMatching(bounds).workArea
-  const y = Math.min(bounds.y, area.y + area.height - value - 6)
-  menuWin.setBounds({ x: bounds.x, y: Math.max(area.y + 6, y), width: MENU_W, height: value })
+  const value = Math.max(80, Math.min(760, Math.round(Number(height) || 0)))
+  menuContentH = value
+  if (!menuBox || menuBox.h === value) return
+  const area = screen.getDisplayMatching({ x: menuBox.x, y: menuBox.y, width: menuBox.w, height: menuBox.h }).workArea
+  const y = Math.min(menuBox.y, area.y + area.height - value - 6)
+  menuBox = { ...menuBox, y: Math.max(area.y + 6, y), w: MENU_BOX_W, h: value }
+  applyCanvas()
 })
 let thresholdWin = null
 
@@ -1515,10 +1744,10 @@ function openThresholdWindow() {
   }
   const width = 320
   const height = 190
-  const b = win && !win.isDestroyed() ? win.getBounds() : null
-  const area = screen.getDisplayMatching(b || screen.getPrimaryDisplay().bounds).workArea
-  const x = b ? Math.min(Math.max(area.x + 8, b.x + b.width + 8), area.x + area.width - width - 8) : area.x + 100
-  const y = b ? Math.min(Math.max(area.y + 8, b.y - 40), area.y + area.height - height - 8) : area.y + 100
+  const b = { x: petRect.x, y: petRect.y, width: petRect.w, height: petRect.h }
+  const area = screen.getDisplayMatching(b).workArea
+  const x = Math.min(Math.max(area.x + 8, b.x + b.width + 8), area.x + area.width - width - 8)
+  const y = Math.min(Math.max(area.y + 8, b.y - 40), area.y + area.height - height - 8)
   thresholdWin = new BrowserWindow({
     width,
     height,

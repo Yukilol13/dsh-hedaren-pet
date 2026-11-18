@@ -1,6 +1,6 @@
 {
   "name": "dsh-hedaren-pet",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "和大人桌面宠物（DeepSeek Harness 插件）：Q 版两头身清朝权臣，自带透明 Electron 窗口、全套 C 版动画与表情、三层记忆聊天人格，还会抽成国库、网住大肥鱼，国库亏空时把自己关进牢房。",

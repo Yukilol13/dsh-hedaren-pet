@@ -12,46 +12,64 @@
     user-select: none; -webkit-user-select: none;
     font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
   }
+  /* 画布里的菜单图层：主列 + 悬停展开的二级列（和 dsh-pet 一样是「旁边弹一列」） */
   #menu {
-    width: 100%;
-    padding: 6px;
+    /* 20% 透（opacity .8）：字还看得清，被挡住的屏幕能隐约看见；要更透就把这里调小 */
+    opacity: .8;
+    display: flex; align-items: flex-start; gap: 6px;
+    width: 100%; height: 100%;
+    font-size: 13px; color: #f6f1e6;
+  }
+  #menu.side-left { flex-direction: row-reverse; }
+  .col {
     border-radius: 12px;
     background: rgba(28, 30, 36, .97);
-    color: #f6f1e6;
-    font-size: 13px;
-    box-shadow: 0 14px 40px rgba(0,0,0,.5);
+    /* 不要投影：投影会让整块画布看起来有重量，还会挡住屏幕 */
+    padding: 6px;
   }
-  #menu .muted { color: rgba(246,241,230,.55); font-size: 11px; padding: 3px 10px; }
-  #menu button {
+  .col.main { width: 220px; flex: 0 0 220px; }
+  .col.sub { width: 206px; flex: 0 0 206px; display: none; }
+  .col.sub.show { display: block; }
+  .head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 6px; padding: 2px 8px 6px;
+  }
+  .head b {
+    /* 跟工作面板进度条同一个金：#d4af37 → #f1d27a 的渐变起点 */
+    color: #d4af37; font-weight: 600; letter-spacing: .5px;
+  }
+  .head span { color: rgba(246,241,230,.42); font-size: 10px; }
+  .sub h4 {
+    margin: 2px 6px 5px; padding-bottom: 4px;
+    font-size: 11px; font-weight: 600; letter-spacing: .5px;
+    color: rgba(212,175,55,.9);
+    border-bottom: 1px solid rgba(255,255,255,.10);
+  }
+  button {
     display: block; width: 100%; text-align: left;
-    padding: 7px 10px; border: 0; border-radius: 8px;
+    padding: 6px 9px; border: 0; border-radius: 8px;
     background: transparent; color: inherit; font: inherit; cursor: pointer;
   }
-  #menu button:hover { background: rgba(255,255,255,.10); }
-  #menu .sep { height: 1px; margin: 5px 4px; background: rgba(255,255,255,.12); }
-  #menu .cat span { float: right; opacity: .55; margin-left: 16px; }
-  .scaleRow {
-    display: flex; align-items: center; gap: 7px;
-    padding: 3px 8px 7px; font-size: 11px; color: rgba(246,241,230,.62);
-  }
-  .scaleRow input[type="range"] {
-    -webkit-appearance: none; appearance: none; flex: 1; min-width: 70px;
-    height: 4px; border-radius: 999px; background: rgba(255,255,255,.22); outline: none;
-  }
-  .scaleRow input[type="range"]::-webkit-slider-thumb {
-    -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%;
-    background: #d4af37; box-shadow: 0 0 0 2px rgba(0,0,0,.4); cursor: pointer;
-  }
-  #scaleVal, #settleVal { min-width: 40px; text-align: right; color: rgba(246,241,230,.85); }
+  button:hover { background: rgba(255,255,255,.10); }
+  /* 有二级的只在自己的行上挂个「正在展开」的底色，不带箭头 */
+  button.cat.open { background: rgba(255,255,255,.14); }
+  .plain { color: rgba(246,241,230,.92); }
+  .sep { height: 1px; margin: 5px 4px; background: rgba(255,255,255,.12); }
+  .sub button { font-size: 12px; padding: 5px 8px; }
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 999px; }
   ::-webkit-scrollbar-track { background: transparent; }</style>
 </head>
 <body>
-<div id="menu"></div>
+<div id="menu" class="side-right">
+  <div class="col main" id="mainCol"></div>
+  <div class="col sub" id="subCol"></div>
+</div>
 <script>
 const $ = (s) => document.querySelector(s)
 const menu = $('#menu')
+const mainCol = $('#mainCol')
+const subCol = $('#subCol')
 
 // 只有这些动作循环播放，其余动作播放一遍就回待机
 const LOOPING_ANIMS = new Set([
@@ -129,111 +147,150 @@ const TREE = {
   },
 }
 
-let category = null
-let scale = 1
-let scaleDragging = false
-let throwSettleMs = 50
-let jailThreshold = 10
-
-const SETTLE_MIN = 50
-const SETTLE_MAX = 500
-
-async function refreshSnapshot() {
-  try {
-    const s = await window.heshen.readState()
-    scale = Math.max(0.7, Math.min(1.5, Number(s.scale) || 1))
-      throwSettleMs = Math.max(SETTLE_MIN, Math.min(SETTLE_MAX, Math.round(Number(s.throwSettleMs) || SETTLE_MIN)))
-    jailThreshold = Math.max(0, Math.min(10000, Math.round((Number(s.jailThreshold) || 10) * 100) / 100))
-  } catch {}
-}
+let openCat = null
+let closeTimer = 0
+const isSub = window.heshen.isSubFrame === true
 
 function el(tag, props = {}, children = []) {
   const node = document.createElement(tag)
   for (const [k, v] of Object.entries(props)) {
     if (k === 'text') node.textContent = v
     else if (k === 'className') node.className = v
-    else if (k.startsWith('data-')) node.setAttribute(k, v)
     else node[k] = v
   }
   for (const c of children) node.appendChild(c)
   return node
 }
 
-function resizeToContent() {
-  requestAnimationFrame(() => {
-    const height = Math.ceil(menu.getBoundingClientRect().height) + 2
-    window.heshen.resizeMenu(height)
-  })
-}
-
-function renderMain() {
-  category = null
-  menu.innerHTML = ''
-  menu.appendChild(el('div', { className: 'muted', text: '和大人' }))
-  // 大小 / 甩飞阈值 / 亏空阈值 这些设置项都搬去「DSH 设置 → 和大人府邸」了，菜单只留动作。
-  menu.appendChild(
-    el('div', { className: 'muted', text: '要调教奴才：DSH 设置 → 和大人府邸' }),
-  )
-
-  menu.appendChild(
-    el('button', { className: 'cat', text: '跟奴才说两句 ', onclick: () => act({ action: 'chat' }) }),
-  )
-  menu.appendChild(
-    el('button', { className: 'cat', text: '查询国库 ', onclick: () => act({ action: 'treasury' }) }),
-  )
-  menu.appendChild(el('div', { className: 'sep' }))
-
-  for (const [key, group] of Object.entries(TREE)) {
-    const btn = el('button', { className: 'cat', text: group.label })
-    btn.appendChild(el('span', { text: '›' }))
-    btn.addEventListener('click', () => {
-      category = key
-      renderSub()
-    })
-    menu.appendChild(btn)
-  }
-
-  menu.appendChild(el('div', { className: 'sep' }))
-  const quit = el('button', { className: 'cat', text: '奴才告退 ', onclick: () => act({ action: 'quit' }) })
-  quit.appendChild(el('span', { text: '›' }))
-  menu.appendChild(quit)
-  resizeToContent()
-}
-
-function renderSub() {
-  const group = TREE[category]
-  if (!group) return renderMain()
-  menu.innerHTML = ''
-  const back = el('button', { className: 'muted', text: `‹ ${group.label}` })
-  back.addEventListener('click', () => renderMain())
-  menu.appendChild(back)
-  for (const item of group.items) {
-    const btn = el('button', { text: item.label })
-    btn.addEventListener('click', () =>
-      act({
-        action: item.action,
-        data: {
-          anim: item.anim,
-          face: item.face,
-          text: item.text,
-          // 只有「待机/循环」类动作循环播放，其余动作播一遍就回待机
-          loop: item.loop !== undefined ? item.loop : LOOPING_ANIMS.has(item.anim),
-        },
-      }),
-    )
-    menu.appendChild(btn)
-  }
-  resizeToContent()
-}
-
 function act(payload) {
   window.heshen.menuAction(payload)
 }
 
-window.heshen.onMenuOpened(async () => {
-  await refreshSnapshot()
+/** 报一次尺寸 + 主列/二级列的矩形（主进程据此只让这两块吃点击，其余画布继续穿透） */
+function report() {
+  requestAnimationFrame(() => {
+    const mainRect = mainCol.getBoundingClientRect()
+    const height = Math.ceil(Math.max(mainRect.height, subCol.classList.contains('show') ? subCol.getBoundingClientRect().height : 0)) + 2
+    const regions = [{ x: mainRect.x, y: mainRect.y, w: mainRect.width, h: mainRect.height }]
+    if (subCol.classList.contains('show')) {
+      const r = subCol.getBoundingClientRect()
+      regions.push({ x: r.x, y: r.y, w: r.width, h: r.height })
+    }
+    window.heshen.resizeMenu(height)
+    if (menuShown) window.heshen.menuRegions?.(regions)
+  })
+}
+
+/** 悬停到有二级的行就展开（不用点）；离开整块菜单再收 */
+function openCategory(key) {
+  const group = TREE[key]
+  if (!group) return
+  if (closeTimer) {
+    clearTimeout(closeTimer)
+    closeTimer = 0
+  }
+  if (openCat === key && subCol.classList.contains('show')) return
+  openCat = key
+  for (const btn of mainCol.querySelectorAll('button.cat')) btn.classList.toggle('open', btn.dataset.cat === key)
+  subCol.innerHTML = ''
+  subCol.appendChild(el('h4', { text: group.label }))
+  for (const item of group.items) {
+    subCol.appendChild(
+      el('button', {
+        text: item.label,
+        onclick: () =>
+          act({
+            action: item.action,
+            data: {
+              anim: item.anim,
+              face: item.face,
+              text: item.text,
+              // 只有「待机/循环」类动作循环播放，其余动作播一遍就回待机
+              loop: item.loop !== undefined ? item.loop : LOOPING_ANIMS.has(item.anim),
+            },
+          }),
+      }),
+    )
+  }
+  subCol.classList.add('show')
+  report()
+}
+
+function closeCategory() {
+  if (!openCat) return
+  openCat = null
+  subCol.classList.remove('show')
+  subCol.innerHTML = ''
+  for (const btn of mainCol.querySelectorAll('button.cat')) btn.classList.remove('open')
+  report()
+}
+
+function scheduleClose() {
+  if (closeTimer) clearTimeout(closeTimer)
+  closeTimer = setTimeout(() => {
+    closeTimer = 0
+    closeCategory()
+  }, 180)
+}
+
+/** 主列：说话 / 国库 / 四组（悬停展开）/ 告退（纯按钮） */
+function renderMain() {
+  mainCol.innerHTML = ''
+  const head = el('div', { className: 'head' }, [
+    el('b', { text: '和大人' }),
+    el('span', { text: '调教：DSH 设置 → 和大人府邸' }),
+  ])
+  head.addEventListener('mouseenter', () => closeCategory())
+  mainCol.appendChild(head)
+  mainCol.appendChild(
+    el('button', { className: 'plain', text: '跟奴才说两句', onclick: () => act({ action: 'chat' }) }),
+  )
+  mainCol.appendChild(
+    el('button', { className: 'plain', text: '查询国库', onclick: () => act({ action: 'treasury' }) }),
+  )
+  // 移到没有二级的行上 → 二级列立刻收起（别让它赖着不回去）
+  for (const btn of mainCol.querySelectorAll('button.plain')) {
+    btn.addEventListener('mouseenter', () => closeCategory())
+  }
+  mainCol.appendChild(el('div', { className: 'sep' }))
+
+  for (const [key, group] of Object.entries(TREE)) {
+    const btn = el('button', { className: 'cat', text: group.label })
+    btn.dataset.cat = key
+    // 悬停即展开；点击也展开（键盘/触控板用户兜底）
+    btn.addEventListener('mouseenter', () => openCategory(key))
+    btn.addEventListener('focus', () => openCategory(key))
+    btn.addEventListener('click', () => openCategory(key))
+    mainCol.appendChild(btn)
+  }
+
+  mainCol.appendChild(el('div', { className: 'sep' }))
+  // 告退没有二级：就是个按钮，点了就走
+  const quitBtn = el('button', { className: 'plain', text: '奴才告退', onclick: () => act({ action: 'quit' }) })
+  quitBtn.addEventListener('mouseenter', () => closeCategory())
+  mainCol.appendChild(quitBtn)
+  report()
+}
+
+// 光标离开整块菜单（主列 + 二级列）才收二级
+menu.addEventListener('mouseleave', scheduleClose)
+menu.addEventListener('mouseenter', () => {
+  if (closeTimer) {
+    clearTimeout(closeTimer)
+    closeTimer = 0
+  }
+})
+
+// 主进程告诉菜单往哪边展开（右边没地方就翻到左边）
+window.heshen.onMenuSide?.((side) => {
+  menu.classList.toggle('side-left', String(side) === 'left')
+})
+
+let menuShown = false
+window.heshen.onMenuOpened(() => {
+  menuShown = true
+  closeCategory()
   renderMain()
-  scaleDragging = false
 })
 
 document.addEventListener('keydown', (e) => {
@@ -241,11 +298,7 @@ document.addEventListener('keydown', (e) => {
 })
 window.addEventListener('contextmenu', (e) => e.preventDefault())
 
-async function boot() {
-  await refreshSnapshot()
-  renderMain()
-}
-boot()
+renderMain()
 </script>
 </body>
 </html>

@@ -7,7 +7,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { copyFileSync, existsSync, statSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -136,16 +136,38 @@ function electronPath() {
   return candidates[0]
 }
 
+/**
+ * 任务管理器里那四个 electron 进程都显示成「和大人」。
+ *
+ * Windows 的任务管理器读的是进程映像名（electron.exe），所以这里复制一份同目录的
+ * `和大人.exe`（同目录才能找到 icu/dll/pak），用那份启动。已有的副本大小对得上就直接复用；
+ * 失败就老老实实退回 electron.exe，不影响桌宠。
+ */
+function brandedElectron(exe, log) {
+  if (process.platform !== 'win32') return exe
+  try {
+    const dest = join(dirname(exe), '和大人.exe')
+    if (existsSync(dest) && statSync(dest).size === statSync(exe).size) return dest
+    copyFileSync(exe, dest)
+    log.info?.(`[heshen-pet] 已生成「和大人.exe」：${dest}`)
+    return dest
+  } catch (error) {
+    log.warn?.(`[heshen-pet] 生成「和大人.exe」失败，改用 electron.exe：${error?.message || String(error)}`)
+    return exe
+  }
+}
+
 function spawnPet(log, extraEnv = {}) {
   const exe = electronPath()
   if (!existsSync(exe)) {
     log.warn?.(`[heshen-pet] 找不到 Electron：${exe}（先启动一次 dsh-pet 让它下载，或设置 DSH_PET_ELECTRON_PATH）`)
     return undefined
   }
+  const launch = brandedElectron(exe, log)
   const env = { ...process.env, DSH_HOME: dshHome(), ...extraEnv }
   // DSH 宿主进程带 ELECTRON_RUN_AS_NODE=1；不清掉的话 Electron 会当 Node 跑，窗口秒退。
   delete env.ELECTRON_RUN_AS_NODE
-  const child = spawn(exe, [APP_DIR], {
+  const child = spawn(launch, [APP_DIR], {
     stdio: 'ignore',
     windowsHide: false,
     env,
